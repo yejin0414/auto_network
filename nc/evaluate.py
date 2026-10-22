@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 import time
 from typing import Any
@@ -95,17 +96,29 @@ def eval_common(dc: DeviceCollection, role: str, th: dict, prev: dict | None, me
             up = P.parse_uptime(r.output)
             metrics.update({k: v for k, v in info.items()})
             metrics["uptime"] = up
-            level, summary, ev = "ok", f"가동 {fmt_uptime(up)}", []
-            prev_up = (prev or {}).get("uptime")
-            prev_ts = (prev or {}).get("ts")
-            if up is not None and prev_up is not None and prev_ts:
-                expected = prev_up + (now - prev_ts)
-                if up + 600 < expected and up < prev_up:
-                    level, summary = "warn", f"재부팅 감지: 이전 점검 이후 다시 시작됨(가동 {fmt_uptime(up)})"
-            elif up is not None and up < 3600:
-                level, summary = "warn", f"최근 재부팅: 가동 {fmt_uptime(up)}"
-            ev = [l for l in r.output.split("\n") if "uptime" in l.lower() or "reboot" in l.lower()][:3]
-            checks.append(check("uptime", "가동시간", level, summary, ev, r))
+            if up is None:
+                checks.append(_failed("uptime", "가동시간", r))
+            else:
+                level, summary, ev = "ok", f"가동 {fmt_uptime(up)}", []
+                prev_up = (prev or {}).get("uptime")
+                prev_ts = (prev or {}).get("ts")
+                expected = None
+                if prev_up is not None and prev_ts:
+                    # Old malformed samples must not discard today's valid run.
+                    try:
+                        if prev_up >= 0 and math.isfinite(prev_up) and math.isfinite(prev_ts):
+                            value = prev_up + (now - prev_ts)
+                            if math.isfinite(value):
+                                expected = value
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                if expected is not None:
+                    if up + 600 < expected and up < prev_up:
+                        level, summary = "warn", f"재부팅 감지: 이전 점검 이후 다시 시작됨(가동 {fmt_uptime(up)})"
+                elif up < 3600:
+                    level, summary = "warn", f"최근 재부팅: 가동 {fmt_uptime(up)}"
+                ev = [l for l in r.output.split("\n") if "uptime" in l.lower() or "reboot" in l.lower()][:3]
+                checks.append(check("uptime", "가동시간", level, summary, ev, r))
         else:
             checks.append(_failed("uptime", "가동시간", r))
 
