@@ -13,7 +13,6 @@ from typing import Any
 from .report_context import capture_context, normalize_context
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started REAL NOT NULL, finished REAL, trigger TEXT, overall TEXT, summary TEXT, report_context TEXT
@@ -41,23 +40,52 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+_INIT_TIMEOUT = 30.0
+_INIT_RETRY_DELAY = 0.05
+
 
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
-        self._db.row_factory = sqlite3.Row
         self._lock = threading.Lock()
-        with self._lock:
-            self._db.executescript(SCHEMA)
-            # Serialize the schema check and ALTER across independent processes.
-            # SQLite commits the migration atomically; retrying an interrupted
-            # startup or opening an already migrated database is safe.
-            with self._db:
+        # Startup retries have one deadline, rather than a fresh SQLite timeout
+        # for every statement. Normal operations regain their 30-second timeout.
+        self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=0)
+        try:
+            self._db.row_factory = sqlite3.Row
+            self._initialize()
+            self._db.execute("PRAGMA busy_timeout=30000")
+        except BaseException:
+            # close() also rolls back any unfinished migration. Failed startup
+            # must not leave a Windows file handle alive in the traceback.
+            self._db.close()
+            raise
+
+    def _initialize(self) -> None:
+        deadline = time.monotonic() + _INIT_TIMEOUT
+        while True:
+            try:
+                # WAL must be selected outside a transaction and can return
+                # SQLITE_BUSY immediately during another connection's startup.
+                self._db.execute("PRAGMA journal_mode=WAL").fetchall()
                 self._db.execute("BEGIN IMMEDIATE")
+                # executescript() would implicitly commit BEGIN IMMEDIATE.
+                # Keep all DDL, the schema check and ALTER in one transaction.
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        self._db.execute(statement)
                 columns = {row["name"] for row in self._db.execute("PRAGMA table_info(runs)")}
                 if "report_context" not in columns:
                     self._db.execute("ALTER TABLE runs ADD COLUMN report_context TEXT")
+                self._db.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                self._db.rollback()
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+                remaining = deadline - time.monotonic()
+                if code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) or remaining <= 0:
+                    raise
+                time.sleep(min(_INIT_RETRY_DELAY, remaining))
 
     def _q(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
