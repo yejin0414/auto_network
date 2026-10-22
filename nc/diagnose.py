@@ -11,6 +11,7 @@ import logging
 import re
 import socket
 import time
+from contextlib import contextmanager
 from typing import Any
 
 from .collector import ConnectFailure, NetmikoDriver, safe_error
@@ -20,29 +21,61 @@ KEXINIT_NAMES = ("kex", "hostkey", "enc_c2s", "enc_s2c", "mac_c2s", "mac_s2c")
 LABEL = {"kex": "키 교환", "hostkey": "호스트 키", "enc_c2s": "암호화", "mac_c2s": "무결성(MAC)"}
 
 
+@contextmanager
+def _closing_probe(resource):
+    """Release acquired resources without hiding an earlier operation error."""
+    try:
+        yield resource
+    except BaseException:
+        try:
+            resource.close()
+        except Exception:
+            pass
+        raise
+    else:
+        resource.close()
+
+
 def read_server_kexinit(host: str, port: int, timeout: float) -> tuple[str, list[str], dict[str, list[str]]]:
     """SSH 서버의 버전 문자열과 지원 암호 방식 목록(KEXINIT)을 읽습니다."""
-    s = socket.create_connection((host, port), timeout=timeout)
-    s.settimeout(timeout)
-    try:
+    with _closing_probe(socket.create_connection((host, port), timeout=timeout)) as s:
+        s.settimeout(timeout)
         s.sendall(b"SSH-2.0-NetcheckProbe_1.0\r\n")
-        buf, pre, banner = b"", [], ""
-        while not banner:
+        # Keep the existing connect/send budgets; all receive stages share one
+        # deadline so a stream of small replies cannot extend the probe forever.
+        deadline = time.monotonic() + timeout
+
+        def receive() -> bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("timed out")
+            s.settimeout(remaining)
             chunk = s.recv(4096)
+            if time.monotonic() > deadline:
+                raise socket.timeout("timed out")
+            return chunk
+
+        buf, pre, banner = b"", [], ""
+        banner_bytes = 0
+        while not banner:
+            chunk = receive()
             if not chunk:
                 raise ConnectionError("서버가 SSH 배너를 보내기 전에 연결을 끊었습니다")
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
+                banner_bytes += len(line) + 1
+                if banner_bytes > 65536:
+                    raise ConnectionError("SSH 배너가 아닌 데이터가 너무 깁니다")
                 text = line.rstrip(b"\r").decode("utf-8", "replace")
                 if text.startswith("SSH-"):
                     banner = text
                     break
                 pre.append(text)
-            if len(buf) > 65536:
+            if not banner and banner_bytes + len(buf) > 65536:
                 raise ConnectionError("SSH 배너가 아닌 데이터가 너무 깁니다")
         while len(buf) < 5:
-            chunk = s.recv(4096)
+            chunk = receive()
             if not chunk:
                 raise ConnectionError("KEXINIT 헤더를 받기 전에 연결이 끊겼습니다")
             buf += chunk
@@ -50,7 +83,7 @@ def read_server_kexinit(host: str, port: int, timeout: float) -> tuple[str, list
         if plen < 6 or plen > 65536:
             raise ConnectionError("KEXINIT 길이가 비정상입니다")
         while len(buf) < 4 + plen:
-            chunk = s.recv(4096)
+            chunk = receive()
             if not chunk:
                 raise ConnectionError("KEXINIT 패킷을 모두 받기 전에 연결이 끊겼습니다")
             buf += chunk
@@ -71,8 +104,6 @@ def read_server_kexinit(host: str, port: int, timeout: float) -> tuple[str, list
             lists[name] = payload[i:i + n].decode("ascii", "replace").split(",") if n else []
             i += n
         return banner, pre, lists
-    finally:
-        s.close()
 
 
 def client_algorithms() -> dict[str, list[str]]:
@@ -152,42 +183,44 @@ def diagnose(device: dict, cred: Credential | None, ssh_cfg: dict) -> dict[str, 
             except Exception as exc:
                 step("SSH 배너", False, f"{type(exc).__name__}: {safe_error(exc)}")
 
+            auth_rejected = False
             try:
-                tr = paramiko.Transport(socket.create_connection((host, port), timeout=timeout))
-                tr.banner_timeout = timeout
-                tr.start_client(timeout=timeout)
-                try:
-                    tr.auth_none(cred.username)
-                    step("인증 방식", True, "인증 없이 로그인 허용(장비 안에서 다시 아이디/비밀번호를 물을 수 있음)")
-                except paramiko.BadAuthenticationType as exc:
-                    step("인증 방식", True, "장비가 허용: " + ", ".join(exc.allowed_types))
-                except Exception as exc:
-                    step("인증 방식", None, f"확인 못함: {type(exc).__name__}")
-                tr.close()
-                tr = paramiko.Transport(socket.create_connection((host, port), timeout=timeout))
-                tr.banner_timeout = timeout
-                tr.start_client(timeout=timeout)
-                try:
-                    tr.auth_password(cred.username, cred.password, fallback=True)
-                    ok = tr.is_authenticated()
-                    step("로그인", ok, "성공" if ok else "추가 인증 필요(2단계 인증 등)")
-                except paramiko.AuthenticationException as exc:
-                    step("로그인", False, f"계정/비밀번호 거부: {safe_error(exc)}. SecureCRT에 저장된 계정과 같은지 확인하세요.")
-                    tr.close()
-                    return _finish(steps, log_buf)
-                if tr.is_authenticated():
-                    ch = tr.open_session(timeout=timeout)
-                    ch.get_pty(term="vt100", width=200, height=50)
-                    ch.invoke_shell()
-                    screen = _read(ch, 6)
-                    if not screen.strip():
-                        ch.send("\r\n")
-                        screen += _read(ch, 4)
-                    ch.close()
-                    lines = [l for l in screen.replace("\r", "").split("\n") if l.strip()]
-                    step("로그인 직후 화면", True, "\n".join(lines[-15:])[-1500:] or "(아무것도 출력되지 않음)")
-                tr.close()
+                with _closing_probe(socket.create_connection((host, port), timeout=timeout)) as sock:
+                    with _closing_probe(paramiko.Transport(sock)) as tr:
+                        tr.banner_timeout = timeout
+                        tr.start_client(timeout=timeout)
+                        try:
+                            tr.auth_none(cred.username)
+                            step("인증 방식", True, "인증 없이 로그인 허용(장비 안에서 다시 아이디/비밀번호를 물을 수 있음)")
+                        except paramiko.BadAuthenticationType as exc:
+                            step("인증 방식", True, "장비가 허용: " + ", ".join(exc.allowed_types))
+                        except Exception as exc:
+                            step("인증 방식", None, f"확인 못함: {type(exc).__name__}")
+                with _closing_probe(socket.create_connection((host, port), timeout=timeout)) as sock:
+                    with _closing_probe(paramiko.Transport(sock)) as tr:
+                        tr.banner_timeout = timeout
+                        tr.start_client(timeout=timeout)
+                        try:
+                            tr.auth_password(cred.username, cred.password, fallback=True)
+                            ok = tr.is_authenticated()
+                            step("로그인", ok, "성공" if ok else "추가 인증 필요(2단계 인증 등)")
+                        except paramiko.AuthenticationException as exc:
+                            step("로그인", False, f"계정/비밀번호 거부: {safe_error(exc)}. SecureCRT에 저장된 계정과 같은지 확인하세요.")
+                            auth_rejected = True
+                            raise
+                        if tr.is_authenticated():
+                            with _closing_probe(tr.open_session(timeout=timeout)) as ch:
+                                ch.get_pty(term="vt100", width=200, height=50)
+                                ch.invoke_shell()
+                                screen = _read(ch, 6)
+                                if not screen.strip():
+                                    ch.send("\r\n")
+                                    screen += _read(ch, 4)
+                            lines = [l for l in screen.replace("\r", "").split("\n") if l.strip()]
+                            step("로그인 직후 화면", True, "\n".join(lines[-15:])[-1500:] or "(아무것도 출력되지 않음)")
             except Exception as exc:
+                if auth_rejected:
+                    return _finish(steps, log_buf)
                 step("SSH 협상/로그인", False, f"{type(exc).__name__}: {safe_error(exc)}")
 
         t0 = time.time()
@@ -214,8 +247,8 @@ def diagnose(device: dict, cred: Credential | None, ssh_cfg: dict) -> dict[str, 
 
 
 def _read(ch, seconds: float) -> str:
-    out, end = "", time.time() + seconds
-    while time.time() < end:
+    out, end = "", time.monotonic() + seconds
+    while time.monotonic() < end:
         if ch.recv_ready():
             out += ch.recv(65535).decode("utf-8", "replace")
         else:
