@@ -554,11 +554,12 @@ class Engine:
             try:
                 from .excel import save_report
 
-                path = save_report(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                   lambda dev, cmd: self.store.get_raw(run_id, dev, cmd),
-                                   self.report_folder(cfg), cfg["retention_days"])
-                saved = str(path)
-                self.last_report = saved
+                report_run, raw = self.store.get_report_snapshot(run_id)
+                if report_run is not None:
+                    path = save_report(report_run, cfg.get("site_name", ""), cfg["thresholds"], raw,
+                                       self.report_folder(cfg), cfg["retention_days"])
+                    saved = str(path)
+                    self.last_report = saved
             except Exception as exc:
                 log.warning("엑셀 보고서 저장 실패: %s", exc)
                 self.last_error = (self.last_error + " " if self.last_error else "") + f"엑셀 보고서를 저장하지 못했습니다: {type(exc).__name__} {exc}"

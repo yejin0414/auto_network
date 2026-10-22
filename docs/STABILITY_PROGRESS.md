@@ -6,7 +6,8 @@
 - 시작 기준 `main` Commit: `bc413434f76068ee443d620a65ba0d622d867cc2`.
 - 기준 Tree: `d9ef5138473bbcd09d5e43469e8eeae7b5250f7b`.
 - 계획 승인: 2026-10-22 대화에서 사용자 승인. S-01부터 한 번에 한 작업씩 수행한다.
-- 작업 브랜치: `stability/s01-credential-startup`. S-01이 미병합 상태이므로 승인된 S-02도 같은 브랜치/PR #8에서 별도 Commit으로 추적한다.
+- 작업 브랜치: `stability/s01-credential-startup`. 미병합 변경을 같은 브랜치/PR #8에서 작업별 별도 Commit으로 추적한다.
+- 계속 진행 승인: 2026-10-22 사용자의 '검증 성공 시 기존 승인 범위 안에서 다음 단계로 계속 진행' 지시에 따라, 실제 검증 성공 후 승인된 다음 작업을 한 번에 하나씩 수행한다. S-04의 별도 방침 승인 보류는 유지한다.
 - S-04의 비정상 수치를 '확인 불가'로 처리하는 방침은 별도 승인 전까지 보류한다.
 - 기존 기능, 장비 명령, 판정 기준, UI/API/보고서 형식, 인증/DB/스케줄 호환성을 보존한다.
 - 운영 장비와 실제 운영 계정/DB는 사용하지 않는다. Mock, Fixture, Demo, 폐기 가능한 Windows CI만 사용한다.
@@ -17,8 +18,8 @@
 전체 진행률 = 검증까지 완료된 작업 가중치 합계 / 확정된 전체 가중치 합계 × 100.
 
 - 전체 작업: 9개, 가중치 합계: 100%.
-- 현재 완료: 2개, 진행 중: 0개, 대기: 6개, 보류: 1개, 실패: 0개.
-- 현재 진행률: **35.0%** ((S-01 15 + S-02 20) / 100). 이전 대비 증가: **+20.0%p**.
+- 현재 완료: 2개, 진행 중: 1개, 대기: 5개, 보류: 1개, 실패: 0개.
+- 현재 진행률: **35.0%** ((S-01 15 + S-02 20) / 100). S-03 착수 후 증가: **+0.0%p**.
 - 진행률: `[███████░░░░░░░░░░░░░] 35.0%` (한 칸 5%p).
 - 로컬 재현 및 테스트 통과만으로 완료 처리하지 않는다. 변경 코드에 대한 실제 GitHub Actions 성공 근거가 필요하다.
 - 미검증, 진행 중, 보류 작업은 완료 가중치에 포함하지 않는다.
@@ -31,7 +32,7 @@
 |---|---|---|---:|---|---|
 | S-01 | 시작 시 인증 조회 실패 후 기존 계정 덮어쓰기 방지 | High | 15% | 완료 | Actions 39786408187 및 39788528305 전체 성공, 330개 테스트 및 EXE 검증 통과 |
 | S-02 | 장비 시간 초과 후 대기 작업 정체 및 늦은 진행 상태 갱신 방지 | High | 20% | 완료 | Actions 39793991393 전체 성공, 345개 테스트 및 EXE 검증 통과 |
-| S-03 | 이력 정리와 조회/보고서 생성 간 일관성 보장 | Medium | 15% | 대기 | 미실행 |
+| S-03 | 이력 정리와 조회/보고서 생성 간 일관성 보장 | Medium | 15% | 진행 중 | 로컬 133개 PASS, 변경 코드 Actions 대기 |
 | S-04 | 비정상 숫자 파싱 오류 격리 | High | 15% | 보류 | 별도 처리 방침 승인 필요 |
 | S-05 | SSH 진단 응답 한도와 연결 자원 정리 | Medium | 10% | 대기 | 미실행 |
 | S-06 | UI 이력 응답 역전 및 일시 조회 실패 복구 | Medium | 10% | 대기 | 미실행 |
@@ -259,6 +260,34 @@ python -m unittest tests.test_engine_timeouts tests.test_timeouts tests.test_clu
 
 - S-01의 수정/검증은 완료했다. PR #8은 검토용 Draft이며 병합/릴리스/배포는 수행하지 않았다.
 - S-02의 수정 및 Windows Actions 검증을 완료했다. 종료에 응답하지 않는 실제 일반 worker/helper는 강제 제거하지 않고 슬롯을 계속 점유한다. 이 경우 후속 미시도 장비는 기존 '확인 불가'로 기록하며, 실행 슬롯이 실제 해제되면 다음 점검에서 복구한다. 기존 클러스터 fallback은 변경하지 않았다.
-- S-03의 이력 삭제 경합, S-05의 진단 자원 정리, S-06–S-08의 재현된 입력/응답 오류는 아직 수정하지 않았다.
+- S-03은 이력 삭제 경합을 재현하고 최소 수정/회귀 검증을 진행 중이다. Actions 성공 전까지 완료 가중치를 반영하지 않는다. S-05의 진단 자원 정리, S-06–S-08의 재현된 입력/응답 오류는 아직 수정하지 않았다.
 - S-04는 잘못된 수치를 어떤 상태로 표시할지 별도 승인 전까지 수정하지 않는다.
-- 다음 작업은 S-03(가중치 15%, Medium), 이력 정리와 조회/보고서 생성 간 일관성 보장이다. 동시 prune 중 부분 이력/빈 원문을 방지하되 스키마/보존 정책/보고서 형식을 유지한다. 이번 변경에는 S-03 코드를 포함하지 않는다. 각 작업 전 실제 기준과 중복 변경 여부를 확인하고 Commit/PR/검증 근거를 이 문서에 이어 기록한다.
+- 현재 작업은 S-03(가중치 15%, Medium), 이력 정리와 조회/보고서 생성 간 일관성 보장이다. 동시 prune 중 부분 이력/빈 원문을 방지하되 스키마/보존 정책/보고서 형식을 유지한다. 성공 후 S-04 보류를 유지하고 승인된 S-05로 진행한다. 각 작업 전 실제 기준과 중복 변경 여부를 확인하고 Commit/PR/검증 근거를 이 문서에 이어 기록한다.
+
+## S-03 실행 기록
+
+- 승인: 검증 성공 후 기존 승인 범위에서 순차 진행하라는 2026-10-22 사용자 지시.
+- 작업 기준: S-02 기록 Commit `90c3bed4cef554f410fd891c48ab9628e9017576`, Tree `984886d21305c4602d5103fd484e5b5109c1f7e6`. `main`은 최초 기준과 동일하며 PR #8은 Draft/미병합임을 재확인했다.
+- 이전 기록 Commit의 추가 [Actions 39797497734](https://github.com/yejin0414/auto_network/actions/runs/39797497734)도 `head_sha=90c3bed4cef554f410fd891c48ab9628e9017576`, `completed/success`로 확인했다(2026-10-22 14:52:56 UTC 갱신). Job `119888494782`의 모든 단계 성공, `Ran 345 tests in 189.214s`, `OK` 및 대용량 DB/EXE/Windows 검증 성공을 실제 로그에서 확인했다. 이 확인은 S-02 중복 가중치로 계산하지 않는다.
+- 수정 전 재현: 합성 임시 SQLite 3.53.1에서 WAL/DELETE × 같은 Store/별도 Store 연결의 네 조합 모두 부모 조회 후 prune을 완료시키면 요약의 장비 수는 남지만 장비 목록이 비었다. 장비 행 조회 후 정리하면 명령 목록이 비었고, 실제 Excel의 첫 원문 조회 후 정리하면 이후 원문 셀이 빈칸으로 성공 저장됐다. Event로 순서를 제어했으며 실제 장비나 운영 DB를 사용하지 않았다.
+- 사전 위험 보고: DELETE 모드에서는 짧은 행 캡처 동안 쓰기 commit이 대기할 수 있다. JSON 변환/압축 해제/Excel 직렬화/파일 저장 전 읽기 트랜잭션과 Store 잠금을 해제한다. 원본 BLOB은 Excel용 단일 이력 snapshot에만 확보하며 일반 이력/HTML에는 추가하지 않는다.
+- 수정: Store의 기존 연결/잠금과 읽기 savepoint로 부모·장비·명령 행을 한 시점에 확보한다. 기존 get_run/get_raw 반환 형식을 유지하고 Excel용 내부 snapshot callback은 같은 시점의 압축 원문만 지연 해제한다. Excel 저장/열기, 다운로드, 자동 저장의 세 진입점에서 이를 사용한다. HTML/일반 이력에는 metadata만 조회한다.
+- 기존 동작 보존: 명령 순서/내용, 판정, DB 스키마·보존 정책, 과거 보고서 context, Excel/HTML 형식과 생성 함수 시그니처를 유지한다. 자동 Excel 오류는 기존 오류 기록 경계 안에서 처리하고 완료 알림은 계속한다. 처음 이력 조회 후 이미 정리된 경우 Excel만 생략한다.
+- 진행 상태: 로컬 검증을 통과하고 작업 Commit을 기존 Draft PR #8에 추가한다. 이 변경의 GitHub Actions 성공은 아직 확인하지 않았으며 진행률은 35.0%다.
+
+### S-03 로컬 재현 및 검증
+
+- 수정 전 S-02 코드에 새 보고서 테스트 중 3개를 그대로 실행했다. 명시/최신 다운로드, 저장/열기, 자동 저장의 5개 하위 사례가 모두 원본 셀 `None`으로 실패했다. 테스트 준비 오류는 없었으며 실제 workbook을 읽어 누락을 확인했다.
+- 수정 후 신규 보고서 경합 테스트 9개 및 기존 저장소 API/수집 회귀를 합한 34개가 PASS(0.380초)다. 같은 command ID를 가진 두 장비의 원문 구분, 당시 임계값·사업장명·판정·시트 보존, 없는 이력 404, 원문 손상/읽기 실패 후 알림 계속, 일반 이력/HTML/알림 전용 경로의 원문 미조회도 확인했다.
+- 기존 과거 보고서/DB 확장성/저장 원자성/백업·복원/SQLite 장애 테스트 59개가 PASS(2.253초)다.
+- 기존 `tests/db_scale_check.py --runs 100 --devices 20 --raw-bytes 1536`의 축소 합성 검증이 모든 단계 PASS다. 저장·조회·원자 쓰기·온라인 백업·외부 전송·원본 없이 복원·fingerprint·정리 보존을 검증했다. 이 소규모 검증을 1GiB Windows 검증으로 표시하지 않는다.
+- 세 제품 변경 파일의 문법 검사와 독립 diff 리뷰에서 차단 결함을 발견하지 못했다. 기존 caller transaction이 있으면 내부 savepoint만 해제하며 그 바깥 transaction은 호출자가 관리한다. SQLite 자체 장애로 이미 취소된 바깥 transaction을 복원한다는 보장은 하지 않는다.
+- 신규 Store 회귀 9개도 PASS(0.784초)다. 같은 Store/별도 연결 × WAL/DELETE 경합, 원본의 지연 해제 및 DB 종료 후 lookup, 단일 회차 범위, 일반 조회의 output 컬럼 미접근, SQL/RELEASE 오류 후 재사용과 최초 오류 보존, 외부 transaction의 미커밋 변경 보존, 최신/미존재 계약을 검증했다. 그중 2개를 수정 전 코드에 적용하면 네 모드/연결 하위 사례 모두 부분 이력으로 FAIL했다.
+- 최종 변경 코드에서 아래 관련 회귀를 함께 실행해 **133개, 13.642초, OK, 종료 코드 0**을 확인했다. 신규 테스트는 두 파일의 18개이며, 기존 테스트 두 곳에는 새 내부 accessor의 Mock 계약만 각 1줄 추가했다.
+
+```text
+python -m unittest tests.test_read_snapshots tests.test_report_read_snapshots tests.test_report_snapshots tests.test_report_capture tests.test_report_window tests.test_optional_reports tests.test_cluster_source_reports tests.test_store_scaling tests.test_store_recovery tests.test_sqlite_faults tests.test_storage_api tests.test_collection_regressions tests.test_engine_timeouts -v
+```
+
+- 로컬 Python 3.12.14 / SQLite 3.53.1에서는 WAL/DELETE를 모두 실행했다. 기존 정책상 WAL을 지원하지 않는 SQLite에서는 WAL 하위 사례를 명시적으로 skip하며, 운영 journal 선택을 바꾸거나 미지원 모드를 강제하지 않는다. 해당 환경의 실제 사용 모드인 DELETE 사례는 계속 실행한다.
+- 변경 파일: `nc/store.py`, `nc/server.py`, `nc/engine.py`, `tests/test_storage_api.py`, `tests/test_collection_regressions.py`, 신규 `tests/test_read_snapshots.py`, 신규 `tests/test_report_read_snapshots.py`, 이 문서. 제품 3개/기존 테스트 2개/기록 1개 변경, 테스트 2개 추가, 삭제 0개다. 이전 S-01/S-02 수정과 장비 명령·판정·UI·보고서 생성 모듈·스키마·workflow·패키지는 유지한다.

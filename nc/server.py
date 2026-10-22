@@ -147,12 +147,12 @@ class App:
         if path in ("/api/excel_open", "/api/excel_save"):
             from .excel import save_report
             cfg = eng.cfg.get()
-            run = eng.store.get_run(int(body["id"]) if body.get("id") else None)
+            run, raw = eng.store.get_report_snapshot(int(body["id"]) if body.get("id") else None)
             if not run:
                 return 404, {"error": "점검 기록이 없습니다."}
             try:
                 p = save_report(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                lambda dev, cmd, rid=run["id"]: eng.store.get_raw(rid, dev, cmd),
+                                raw,
                                 eng.report_folder(cfg), cfg["retention_days"])
             except PermissionError:
                 return 409, {"error": "같은 이름의 엑셀 파일이 열려 있어 저장하지 못했습니다. 엑셀에서 닫고 다시 누르세요."}
@@ -340,15 +340,18 @@ def make_handler(app: App):
                 if not secrets.compare_digest(q.get("t", ""), app.token):
                     return self._send(403, {"error": "권한 없음"})
                 try:
-                    run = app.engine.store.get_run(int(q["id"]) if q.get("id") else None)
+                    rid = int(q["id"]) if q.get("id") else None
+                    if url.path == "/report.xlsx":
+                        run, raw = app.engine.store.get_report_snapshot(rid)
+                    else:
+                        run = app.engine.store.get_run(rid)
                     if not run:
                         return self._send(404, {"error": "점검 기록이 없습니다."})
                     cfg = app.engine.cfg.get()
                     if url.path == "/report.xlsx":
                         from urllib.parse import quote
                         from .excel import build_workbook, report_filename
-                        data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                              lambda dev, cmd: app.engine.store.get_raw(run["id"], dev, cmd))
+                        data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"], raw)
                         name = report_filename(run)
                         return self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                           {"Content-Disposition": f"attachment; filename=\"netcheck.xlsx\"; filename*=UTF-8''{quote(name)}"})

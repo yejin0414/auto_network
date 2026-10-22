@@ -156,6 +156,7 @@ class ReportErrorRegressions(unittest.TestCase):
         cfg = validate({"report": {"notify": False}})
         store = Mock()
         store.get_run.side_effect = [None, {"id": 1}]
+        store.get_report_snapshot.return_value = ({"id": 1}, lambda *_: None)
         store.baselines.return_value = {}
         store.previous_metrics.return_value = {}
         store.commit_run.return_value = 1

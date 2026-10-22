@@ -170,6 +170,7 @@ class StorageApi(unittest.TestCase):
 
     def test_record_api_and_report_download_read_errors_return_503(self):
         self.store.get_run.side_effect = sqlite3.DatabaseError('sensitive path marker')
+        self.store.get_report_snapshot.side_effect = sqlite3.DatabaseError('sensitive path marker')
         self.assertEqual(self.app.handle_get('/api/run', {})[0], 503)
         for path in ['/report', '/report.xlsx']:
             handler = object.__new__(make_handler(self.app))
