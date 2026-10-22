@@ -6,6 +6,7 @@ import html
 import time
 
 from .evaluate import LEVEL_LABEL, fmt_uptime
+from .report_context import resolve_context
 
 ROLE_ORDER = {"BB": 0, "MM": 1, "WLC": 2}
 ROLE_NAME = {"BB": "백본", "MM": "Mobility Master", "WLC": "WLC"}
@@ -17,6 +18,7 @@ def _e(v) -> str:
 
 
 def render(run: dict, site: str) -> str:
+    site, _thresholds, context_note = resolve_context(run, site)
     s = run["summary"]
     t = time.strftime("%Y-%m-%d %H:%M", time.localtime(run["started"]))
     counts = s.get("counts", {})
@@ -61,6 +63,7 @@ code{{font-family:Consolas,monospace;font-size:12px}} .meta{{color:#5b6577;margi
 </style></head><body>
 <h1>{_e(site)} 무선망 점검 보고서</h1>
 <div class="meta">점검 시각 {t} · 회차 #{run['id']} · {'자동' if run.get('trigger') == 'auto' else '수동'} 점검</div>
+<div class="meta">{_e(context_note)}</div>
 <div class="kpi"><div><b style="color:{COLOR[s['overall']]}">{LEVEL_LABEL[s['overall']]}</b>종합</div>
 <div><b>{counts.get('crit', 0)}</b>장애</div><div><b>{counts.get('warn', 0)}</b>주의</div>
 <div><b>{counts.get('unknown', 0)}</b>확인 불가</div><div><b>{counts.get('ok', 0)}</b>정상</div>

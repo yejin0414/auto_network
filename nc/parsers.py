@@ -438,6 +438,40 @@ def parse_vrrp(text: str) -> list[dict[str, str]]:
     return groups
 
 
+def parse_vrrp_snapshot(text: str) -> list[dict[str, str]] | None:
+    """확인된 그룹 목록([]는 명시적 0개), 해석 불가/불완전 출력은 None.
+
+    부분 출력이나 빈 응답을 '모든 그룹 소실'로 단정하지 않습니다.
+    기존 parse_vrrp의 목록 반환 계약은 유지합니다.
+    """
+    body = clean(text)
+    groups = parse_vrrp(body)
+    for line in body.splitlines():
+        # A row/header that identifies another group is evidence of its presence,
+        # even when its state or the rest of a verbose block could not be parsed.
+        # Do not turn that partially understood output into a missing-group alarm.
+        table_row = re.match(r"^\s*[A-Za-z][\w./:-]*\d[\w./:-]*\s+\d+(?:\s|$)", line)
+        verbose_header = (re.match(r"^\s*Interface\s*:?[ \t]*[A-Za-z][\w./:-]*\d", line, re.I)
+                          or re.match(r"^\s*[A-Za-z][\w./:-]*\d[\w./:-]*\s*(?:\||$)", line)
+                          or re.search(r"\b(?:Virtual\s+Router(?:\s+ID)?\s*[:=]?\s*\d|VRID\s*[:=]\s*\d)", line, re.I))
+        if (table_row or verbose_header) and not parse_vrrp(line):
+            return None
+    totals = re.findall(r"^\s*Total\s+number\s+of\s+virtual\s+routers\s*:\s*(\d+)\s*$", body, re.I | re.M)
+    if totals and (len(set(totals)) != 1 or int(totals[0]) != len(groups)):
+        return None
+    if groups:
+        keys = [vrrp_group_key(g["interface"], g["vrid"]) for g in groups]
+        if len(keys) != len(set(keys)) or any(g["state"] not in ("Master", "Backup", "Initialize", "Inactive") for g in groups):
+            return None
+        return groups
+    if totals and int(totals[0]) == 0:
+        return []
+    # Only an explicit no-configuration message counts as a verified empty set.
+    if re.fullmatch(r"\s*No\s+VRRP\s+(?:groups?\s+)?configured\.?\s*", body, re.I):
+        return []
+    return None
+
+
 _VRRP_ID = re.compile(r"(?:virtual\s+router|VRID|VR)\s*[:=]?\s*(\d+)", re.I)
 _VRRP_FROMTO = re.compile(r"\bfrom\s+([A-Za-z]+)\s+to\s+([A-Za-z]+)", re.I)
 _VRRP_INTF = re.compile(r"\b(Vlan-interface\s?\d+|Vlanif\s?\d+|Vlan\s?\d+|(?:Ten-|Forty-|Hundred-|Twenty-Five-)?GigabitEthernet\s?[\d/:.]+|"
@@ -450,28 +484,32 @@ def log_time_ts(text: str, now: float | None = None) -> float | None:
     import time as _t
     from datetime import datetime as _dt
 
-    m = re.match(r"^\s*([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})(?::\d+)?(?:\s+(\d{4}))?", text or "")
+    m = re.match(r"^\s*([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})(?::(\d+))?(?:\s+(\d{4}))?", text or "")
     if not m or m.group(1).lower() not in _MONTHS:
         return None
-    now = now or _t.time()
-    year = int(m.group(6)) if m.group(6) else _dt.fromtimestamp(now).year
+    now = now if now is not None else _t.time()
+    year = int(m.group(7)) if m.group(7) else _dt.fromtimestamp(now).year
+    microsecond = int((m.group(6) or "0").ljust(6, "0")[:6])
     try:
-        dt = _dt(year, _MONTHS[m.group(1).lower()], int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        dt = _dt(year, _MONTHS[m.group(1).lower()], int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), microsecond)
+        if not m.group(7) and dt.timestamp() > now + 86400:
+            dt = dt.replace(year=year - 1)
     except ValueError:
         return None
-    if not m.group(6) and dt.timestamp() > now + 86400:
-        dt = dt.replace(year=year - 1)
     return dt.timestamp()
 
 
 def vrrp_group_key(intf: str, vrid: str) -> str:
     """show vrrp의 'Vlan20' 와 로그의 'Vlan-interface20' 를 같은 그룹으로 맞춤."""
     i = re.sub(r"\s+", "", intf or "")
-    i = re.sub(r"(?i)^vlan(?:-interface|if)?(\d+)$", r"Vlan\1", i)
-    return f"{i}/{vrid}"
+    vlan = re.fullmatch(r"vlan(?:-interface|if)?(\d+)", i, re.I)
+    i = f"Vlan{int(vlan.group(1))}" if vlan else i.casefold()
+    v = str(vrid).strip()
+    v = str(int(v)) if v.isdigit() else v
+    return f"{i}/{v}"
 
 
-def parse_vrrp_logs(text: str) -> list[dict[str, Any]]:
+def parse_vrrp_logs(text: str, now: float | None = None) -> list[dict[str, Any]]:
     """show logbuffer 출력에서 VRRP 상태 변경 로그(언제, 어느 그룹, 무엇→무엇)를 뽑습니다."""
     out: list[dict[str, Any]] = []
     for x in parse_logbuffer(text, 5000):
@@ -485,7 +523,7 @@ def parse_vrrp_logs(text: str) -> list[dict[str, Any]]:
         intf = _VRRP_INTF.search(x["message"])
         vrid = vid.group(1) if vid else ""
         out.append({
-            "time": x["time"], "ts": log_time_ts(x["time"]), "vrid": vrid,
+            "time": x["time"], "ts": log_time_ts(x["time"], now=now), "vrid": vrid,
             "interface": (intf.group(1) if intf else ""),
             "group": vrrp_group_key(intf.group(1) if intf else "", vrid),
             "old": ft.group(1).capitalize(), "new": ft.group(2).capitalize(),
