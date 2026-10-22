@@ -24,6 +24,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .evaluate import LEVEL_LABEL, fmt_uptime
+from .report_context import resolve_context, saved_metric_level
 
 FONT = "맑은 고딕"
 INK = "172033"
@@ -126,7 +127,9 @@ def build_workbook(run: dict, site: str, thresholds: dict, raw: Callable[[str, s
     started = time.strftime("%Y-%m-%d %H:%M", time.localtime(run["started"]))
     s = run["summary"]
     devs = sorted(run["devices"].values(), key=lambda d: (ROLE_ORDER.get(d["role"], 9), d.get("cluster", ""), d["name"]))
-    th = thresholds
+    # Keep the public signature for existing callers, but never reinterpret a
+    # historical run using thresholds supplied by today's configuration.
+    site, th, context_note = resolve_context(run, site)
     sub = f"{site}  |  점검 시각 {started}  |  회차 #{run['id']}  |  {'자동' if run.get('trigger') == 'auto' else '수동'} 점검"
 
     wb = Workbook()
@@ -153,8 +156,7 @@ def build_workbook(run: dict, site: str, thresholds: dict, raw: Callable[[str, s
                 _pct(m.get("cpu")), _pct(m.get("mem")), fmt_uptime(m.get("uptime")) if m.get("uptime") is not None else "-",
                 d.get("issues", 0), note],
                fmts={5: PCT, 6: PCT, 8: "0"}, level=d["status"], level_col=4, wrap={9})
-    sh.finish(f"CPU는 백본 Last 1 min(슬롯 중 최대), 컨트롤러 100% - idle 기준. 판단 기준: CPU 주의 {th['cpu_warn']:g}% / 장애 {th['cpu_crit']:g}%, "
-              f"메모리 사용 주의 {th['mem_warn']:g}% / 장애 {th['mem_crit']:g}%.")
+    sh.finish(context_note)
 
     # ------------------------------------------------------------------ 백본 CPU·메모리
     ws = wb.create_sheet("백본 CPU·메모리")
@@ -169,23 +171,28 @@ def build_workbook(run: dict, site: str, thresholds: dict, raw: Callable[[str, s
         mslots = {str(x["slot"]).split("/")[0]: x for x in mem.get("slots", [])}
         keys = sorted(set(cslots) | set(mslots), key=lambda k: (len(k), k)) or [""]
         if not d["connected"] or (not cslots and not mslots):
-            sh.add([d["name"], d["host"], "-", None, None, None, None, None, None, None, LEVEL_LABEL[d["status"]]],
-                   level=d["status"], level_col=11)
+            lv = d["status"] if not d["connected"] else saved_metric_level(d)
+            sh.add([d["name"], d["host"], "-", None, None, None, None, None, None, None, LEVEL_LABEL[lv]],
+                   level=lv, level_col=11)
             continue
         for k in keys:
             cc, mm = cslots.get(k, {}), mslots.get(k, {})
             free_ratio = mm.get("free_ratio")
             used_pct = None if free_ratio is None else 100 - free_ratio
-            lv = _level_for(cc.get("1m"), th["cpu_warn"], th["cpu_crit"])
-            lv2 = _level_for(used_pct, th["mem_warn"], th["mem_crit"])
-            rank = {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}
-            row_lv = max([lv or "unknown", lv2 or "unknown"], key=lambda x: rank[x])
+            if th is None:
+                row_lv = saved_metric_level(d)
+            else:
+                lv = _level_for(cc.get("1m"), th["cpu_warn"], th["cpu_crit"])
+                lv2 = _level_for(used_pct, th["mem_warn"], th["mem_crit"])
+                rank = {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}
+                row_lv = max([lv or "unknown", lv2 or "unknown"], key=lambda x: rank[x])
             sh.add([d["name"], d["host"], k or "-", _pct(cc.get("5s")), _pct(cc.get("1m")), _pct(cc.get("5m")),
                     _mb(mm.get("total_kb")), _mb(mm.get("used_kb")), _mb(mm.get("free_kb")), _pct(free_ratio),
                     LEVEL_LABEL[row_lv]],
                    fmts={4: PCT, 5: PCT, 6: PCT, 7: NUM, 8: NUM, 9: NUM, 10: PCT}, level=row_lv, level_col=11)
-    sh.finish("상태는 슬롯별 Last 1 min CPU와 메모리 사용률(100% - FreeRatio)을 판단 기준과 비교한 값입니다. "
-              "MB = 장비가 보고한 KB ÷ 1024.")
+    sh.finish(("상태는 슬롯별 Last 1 min CPU와 메모리 사용률(100% - FreeRatio)을 당시 판단 기준과 비교한 값입니다. "
+               if th is not None else "당시 판단 기준 없음: 상태는 장비 단위로 저장된 CPU·메모리 결과입니다. 슬롯별 재판정은 하지 않았습니다. ")
+              + "MB = 장비가 보고한 KB ÷ 1024.")
 
     # ------------------------------------------------------------------ 컨트롤러 CPU·메모리
     ws = wb.create_sheet("컨트롤러 CPU·메모리")
@@ -196,15 +203,20 @@ def build_workbook(run: dict, site: str, thresholds: dict, raw: Callable[[str, s
         m = d.get("metrics", {})
         cpu = m.get("cpu_detail") or {}
         mem = m.get("mem_detail") or {}
-        lv = d["status"] if not d["connected"] else max(
-            [_level_for(m.get("cpu"), th["cpu_warn"], th["cpu_crit"]) or "unknown",
-             _level_for(m.get("mem"), th["mem_warn"], th["mem_crit"]) or "unknown"],
-            key=lambda x: {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}[x])
+        if not d["connected"]:
+            lv = d["status"]
+        elif th is None:
+            lv = saved_metric_level(d)
+        else:
+            lv = max([_level_for(m.get("cpu"), th["cpu_warn"], th["cpu_crit"]) or "unknown",
+                      _level_for(m.get("mem"), th["mem_warn"], th["mem_crit"]) or "unknown"],
+                     key=lambda x: {"ok": 0, "unknown": 1, "warn": 2, "crit": 3}[x])
         sh.add([_kind(d), d["name"], d["host"], m.get("model") or "-", _pct(cpu.get("user")), _pct(cpu.get("system")), _pct(cpu.get("idle")),
                 _mb(mem.get("total_kb")), _mb(mem.get("used_kb")), _mb(mem.get("free_kb")), _pct(mem.get("used_pct")),
                 LEVEL_LABEL[lv]],
                fmts={5: PCT, 6: PCT, 7: PCT, 8: NUM, 9: NUM, 10: NUM, 11: PCT}, level=lv, level_col=12)
-    sh.finish("상태는 CPU(100% - idle)와 메모리 Used %를 판단 기준과 비교한 값입니다(장비 전체 상태는 요약 시트 참고).")
+    sh.finish("상태는 CPU(100% - idle)와 메모리 Used %를 당시 판단 기준과 비교한 값입니다(장비 전체 상태는 요약 시트 참고)."
+              if th is not None else "당시 판단 기준 없음: 상태는 저장된 CPU·메모리 점검 결과입니다. 현재 임계값으로 재판정하지 않았습니다.")
 
     # ------------------------------------------------------------------ 백본 로그
     ws = wb.create_sheet("백본 로그")

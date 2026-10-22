@@ -252,7 +252,8 @@ class Engine:
         evaluation, new_base = evaluate_run(cfg, collections, clusters, self.store.baselines(),
                                             self.store.previous_metrics(), now=started)
         finished = time.time() if now is None else started + 40
-        run_id = self.store.save_run(started, finished, trigger, evaluation, collections, clusters)
+        run_id = self.store.save_run(started, finished, trigger, evaluation, collections, clusters,
+                                     report_config=cfg)
         self.store.save_baselines(new_base)
         self.store.add_events(self._diff_events(prev_run, evaluation, run_id, started))
         try:
@@ -307,31 +308,64 @@ class Engine:
     @staticmethod
     def _vrrp_rows(prev: dict | None, cur: dict, run_id: int, ts: float) -> list[dict]:
         """VRRP 변경 이력: (1) 직전 점검과 역할이 달라진 그룹, (2) 장비 로그(logbuffer)의 VRRP 상태 변경.
-        둘이 같은 변경이면 한 줄로 합쳐 장비 로그의 정확한 시각을 붙입니다."""
+        같은 그룹·전환의 유일한 로그가 관측 구간 안에 있을 때만 둘을 합칩니다.
+        개별 명령의 관측 시각은 없으므로 직전 완료~이번 시작 사이를 보수적으로 사용합니다.
+        모호하거나 시각이 불명확한 로그는 별도 기록으로 보존합니다."""
+        import math
+
         from .parsers import vrrp_group_key
+
+        def timestamp(value):
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                return value
+            return None
+
+        def norm(key):
+            return vrrp_group_key(*key.rsplit("/", 1)) if "/" in key else key.casefold()
 
         rows: list[dict] = []
         prev_devs = (prev or {}).get("devices", {})
         prev_ts = (prev or {}).get("started")
+        lower = timestamp((prev or {}).get("finished"))
+        if lower is None:
+            lower = timestamp(prev_ts)
+        upper = timestamp(ts)
+        bounded = lower is not None and upper is not None and lower < upper
         for dev_id, res in cur["devices"].items():
             m = res.get("metrics") or {}
-            logs = list(m.get("vrrp_logs") or [])
+            logs = []
+            seen = set()
+            for raw in m.get("vrrp_logs") or []:
+                x = dict(raw)
+                x["group"] = norm(x.get("group") or vrrp_group_key(x.get("interface", ""), x.get("vrid", "")))
+                x["old"], x["new"] = x.get("old", "").capitalize(), x.get("new", "").capitalize()
+                x["ts"] = timestamp(x.get("ts"))
+                identity = tuple(x.get(k) for k in ("group", "old", "new", "time", "ts", "text"))
+                if identity not in seen:
+                    seen.add(identity)
+                    logs.append(x)
             used: set[int] = set()
             old = ((prev_devs.get(dev_id) or {}).get("metrics") or {}).get("vrrp") or {}
-            norm = lambda k: vrrp_group_key(*k.rsplit("/", 1)) if "/" in k else k
-            old_n = {norm(k): v for k, v in old.items()}
+            old_n = {norm(k): v.capitalize() for k, v in old.items()}
             for k, v in (m.get("vrrp") or {}).items():
-                g = norm(k)
+                g, v = norm(k), v.capitalize()
                 if g not in old_n or old_n[g] == v:
                     continue
                 row = {"device_id": dev_id, "device_name": res["name"], "grp": g, "old": old_n[g], "new": v,
                        "detected": ts, "prev_check": prev_ts, "run_id": run_id, "source": "check"}
-                vrid = g.rsplit("/", 1)[-1]
-                for i, x in enumerate(logs):
-                    if i not in used and x["vrid"] == vrid and x["new"] == v:
+                if bounded and "/" in g and all(g.rsplit("/", 1)):
+                    # Multiple transitions in this group cannot establish which one
+                    # produced the observed role, even when one old/new pair matches.
+                    candidates = [(i, x) for i, x in enumerate(logs) if x["group"] == g and
+                                  (x["ts"] is None or lower < x["ts"] <= upper)]
+                    if len(candidates) == 1:
+                        i, x = candidates[0]
+                    else:
+                        i, x = -1, {}
+                    if (i not in used and x.get("ts") is not None and x.get("old") == old_n[g]
+                            and x.get("new") == v):
                         used.add(i)
                         row.update(log_time=x["time"], log_ts=x["ts"], text=x["text"], source="check+log")
-                        break
                 rows.append(row)
             for i, x in enumerate(logs):
                 if i in used:

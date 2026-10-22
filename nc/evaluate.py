@@ -239,24 +239,27 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
 
     r = dc.results.get("vrrp")
     if r:
-        groups = P.parse_vrrp(r.output) if r.ok else []
-        if groups:
-            prev = base.get("vrrp", {})
-            cur = {f"{g['interface']}/{g['vrid']}": g["state"] for g in groups}
+        groups = P.parse_vrrp_snapshot(r.output) if r.ok else None
+        if groups is not None:
+            prev = {P.vrrp_group_key(*k.rsplit("/", 1)): v for k, v in base.get("vrrp", {}).items() if "/" in k}
+            cur = {P.vrrp_group_key(g["interface"], g["vrid"]): g["state"] for g in groups}
             init = [f"{k} {v}" for k, v in cur.items() if v in ("Initialize", "Inactive")]
+            missing = sorted(set(prev) - set(cur))
             changed = [f"{k}: {prev[k]} → {v}" for k, v in cur.items() if k in prev and prev[k] != v and v not in ("Initialize", "Inactive")]
             masters = sum(1 for v in cur.values() if v == "Master")
             metrics["vrrp"] = cur
-            if init:
-                checks.append(check("vrrp", "VRRP", "crit", f"비활성 그룹 {len(init)}개", init, r))
+            if init or missing:
+                parts = ([f"비활성 그룹 {len(init)}개"] if init else []) + ([f"기준 대비 사라진 그룹 {len(missing)}개"] if missing else [])
+                checks.append(check("vrrp", "VRRP", "crit", " · ".join(parts),
+                                    init + [f"{k}: 그룹 사라짐" for k in missing], r))
             elif changed:
                 checks.append(check("vrrp", "VRRP", "warn", f"역할 변화 {len(changed)}개",
                                     changed + ["확인했으면 ‘VRRP 이력’ 탭에서 ‘확인 · 초기화’를 누르세요(현재 역할을 새 기준으로)."], r))
             else:
                 checks.append(check("vrrp", "VRRP", "ok", f"{len(cur)}개 그룹 · Master {masters} / Backup {len(cur) - masters}", [], r))
-            if "vrrp" not in base:
+            if "vrrp" not in base and cur and not init:
                 nb["vrrp"] = cur
-        elif not r.ok:
+        else:
             checks.append(_failed("vrrp", "VRRP", r))
     return nb
 
@@ -298,7 +301,7 @@ def evaluate_run(
                 logs = P.parse_logbuffer(lr.output, 100) if lr.ok else []
                 metrics["log"] = logs[:100]
                 if lr.ok:
-                    vl = P.parse_vrrp_logs(lr.output)
+                    vl = P.parse_vrrp_logs(lr.output, now=now)
                     if vl:
                         metrics["vrrp_logs"] = vl[:50]
                 serious = [x for x in logs if x["severity"] is not None and x["severity"] <= 3]

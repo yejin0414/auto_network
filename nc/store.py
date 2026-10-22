@@ -10,11 +10,13 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from .report_context import capture_context, normalize_context
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  started REAL NOT NULL, finished REAL, trigger TEXT, overall TEXT, summary TEXT
+  started REAL NOT NULL, finished REAL, trigger TEXT, overall TEXT, summary TEXT, report_context TEXT
 );
 CREATE TABLE IF NOT EXISTS device_results (
   run_id INTEGER NOT NULL, device_id TEXT NOT NULL, status TEXT, cpu REAL, mem REAL, data TEXT,
@@ -48,6 +50,14 @@ class Store:
         self._lock = threading.Lock()
         with self._lock:
             self._db.executescript(SCHEMA)
+            # Serialize the schema check and ALTER across independent processes.
+            # SQLite commits the migration atomically; retrying an interrupted
+            # startup or opening an already migrated database is safe.
+            with self._db:
+                self._db.execute("BEGIN IMMEDIATE")
+                columns = {row["name"] for row in self._db.execute("PRAGMA table_info(runs)")}
+                if "report_context" not in columns:
+                    self._db.execute("ALTER TABLE runs ADD COLUMN report_context TEXT")
 
     def _q(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -55,12 +65,14 @@ class Store:
 
     # ------------------------------------------------------------- 회차
     def save_run(self, started: float, finished: float, trigger: str, evaluation: dict,
-                 collections: dict, clusters: dict | None) -> int:
+                 collections: dict, clusters: dict | None, *, report_config: dict | None = None) -> int:
         summary = evaluation["summary"]
+        context = (json.dumps(capture_context(report_config), ensure_ascii=False, allow_nan=False)
+                   if report_config is not None else None)
         with self._lock, self._db:
             cur = self._db.execute(
-                "INSERT INTO runs(started, finished, trigger, overall, summary) VALUES (?,?,?,?,?)",
-                (started, finished, trigger, summary["overall"], json.dumps(summary, ensure_ascii=False)),
+                "INSERT INTO runs(started, finished, trigger, overall, summary, report_context) VALUES (?,?,?,?,?,?)",
+                (started, finished, trigger, summary["overall"], json.dumps(summary, ensure_ascii=False), context),
             )
             run_id = int(cur.lastrowid)
             for dev_id, res in evaluation["devices"].items():
@@ -114,8 +126,13 @@ class Store:
             data = json.loads(d["data"])
             data["commands"] = cmds.get(d["device_id"], [])
             devices[d["device_id"]] = data
+        try:
+            context = normalize_context(json.loads(r["report_context"] or "null"))
+        except (TypeError, ValueError):
+            context = None
         return {"id": r["id"], "started": r["started"], "finished": r["finished"], "trigger": r["trigger"],
-                "overall": r["overall"], "summary": json.loads(r["summary"] or "{}"), "devices": devices}
+                "overall": r["overall"], "summary": json.loads(r["summary"] or "{}"), "devices": devices,
+                "report_context": context}
 
     def get_raw(self, run_id: int, device_id: str, cmd_id: str) -> dict | None:
         rows = self._q("SELECT * FROM raw_outputs WHERE run_id=? AND device_id=? AND cmd_id=?", (run_id, device_id, cmd_id))
