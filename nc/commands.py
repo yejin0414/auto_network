@@ -13,7 +13,7 @@ class CommandSpec:
     id: str
     label: str
     commands: tuple[str, ...]
-    optional: bool = False          # 실패해도 장비 상태를 '확인 불가'로 만들지 않음
+    optional: bool = False          # 장비별 제공 여부가 다른 보조 명령; 실패/해석 불가는 판정기에서 별도 처리
     cluster: bool = False           # 클러스터 대표 WLC 1대에서만 실행
     timeout: int = 0                # 0이면 기본값 사용
     expect: str = ""                # 출력에 이 패턴이 없으면 다음 대체 명령을 시도(정규식)

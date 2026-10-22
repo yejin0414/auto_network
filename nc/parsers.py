@@ -385,18 +385,27 @@ def parse_lagg(text: str) -> dict[str, dict[str, int]]:
     """display link-aggregation summary → {BAGG: {selected, unselected}}."""
     result: dict[str, dict[str, int]] = {}
     for line in clean(text).split("\n"):
-        m = re.match(r"^\s*((?:BAGG|RAGG|Bridge-Aggregation|Route-Aggregation)\d+)\b(.*)$", line, re.I)
+        m = re.match(r"^\s*((?:BAGG|RAGG|BLAGG|Bridge-Aggregation|Route-Aggregation|Blade-Aggregation)\d+)\b(.*)$", line, re.I)
         if not m:
             continue
         rest = m.group(2)
-        sm = re.search(r"Selected\s+(\d+)\s*/\s*(\d+)", rest, re.I)
+        sm = re.fullmatch(r"\s*Selected\s+(\d+)\s*/\s*(\d+)\s*", rest, re.I)
         if sm:
-            sel, tot = int(sm.group(1)), int(sm.group(2))
-            result[m.group(1)] = {"selected": sel, "unselected": tot - sel}
+            sel, tot = to_int(sm.group(1)), to_int(sm.group(2))
+            if sel is not None and tot is not None and sel <= tot:
+                result[m.group(1)] = {"selected": sel, "unselected": tot - sel}
             continue
-        ints = [int(t) for t in rest.split() if t.isdigit()]
-        if len(ints) >= 2:
-            result[m.group(1)] = {"selected": ints[0], "unselected": ints[1]}
+        # Read fields in their positions: filtering for digit tokens can turn
+        # '-1 0 0' or '2 unknown 0' into two apparently healthy counters.
+        counts = re.fullmatch(r"\s*(\d+)\s+(\d+)(?:\s+\d+)?\s*", rest)
+        if counts is None:
+            counts = re.fullmatch(
+                r"\s*[SD]\s+(?:(?:0x[\da-f]+,\s*[\da-f:.-]+|None)\s+)?"
+                r"(\d+)\s+(\d+)\s+\d+\s+(?:Shar|NonS)\s*", rest, re.I)
+        if counts:
+            sel, unsel = to_int(counts.group(1)), to_int(counts.group(2))
+            if sel is not None and unsel is not None:
+                result[m.group(1)] = {"selected": sel, "unselected": unsel}
     return result
 
 
@@ -576,6 +585,232 @@ def parse_device_slots(text: str) -> list[dict[str, str]]:
         if m:
             items.append({"slot": m.group(1), "type": "", "state": m.group(2).capitalize(), "line": line.strip()})
     return items
+
+
+# Optional status commands need a completeness contract distinct from the
+# permissive parsers above. None means unknown/partial; [] or {} means an
+# explicitly confirmed empty set. Bare headers and blank output are unknown.
+def _snapshot_lines(text: str, command: str) -> list[str] | None:
+    if PAGER_RE.search(text or ""):
+        return None
+    lines = []
+    echo = re.compile(r"^(?:(?:<[^>]+>|\[[^]]+\]|[\w.-]+[#>])\s*)?" + re.escape(command) + r"\s*$", re.I)
+    for line in clean(text).splitlines():
+        line = line.strip()
+        if not line or PROMPT_RE.fullmatch(line) or echo.fullmatch(line) or SEPARATOR_RE.fullmatch(line):
+            continue
+        if (ERROR_LINE_RE.search(line) or re.search(r"\b(?:permission denied|not supported|unsupported command)\b", line, re.I)):
+            return None
+        lines.append(line)
+    return lines or None
+
+
+def _snapshot_count(lines: list[str], total_pattern: str, empty_pattern: str) -> tuple[list[str], int | None] | None:
+    """Remove explicit totals/empty declarations, rejecting contradictory ones."""
+    rows, counts = [], []
+    for line in lines:
+        total = re.fullmatch(total_pattern, line, re.I)
+        if total:
+            count = to_int(total.group(1))
+            if count is None:
+                return None
+            counts.append(count)
+        elif re.fullmatch(empty_pattern, line, re.I):
+            counts.append(0)
+        else:
+            rows.append(line)
+    if len(set(counts)) > 1:
+        return None
+    return rows, counts[0] if counts else None
+
+
+def parse_device_slots_snapshot(text: str) -> list[dict[str, str]] | None:
+    lines = _snapshot_lines(text, "display device")
+    if lines is None:
+        return None
+    counted = _snapshot_count(lines, r"Total(?: number of)? slots?\s*:\s*(\d+)\.?", r"No slots?(?: configured)?\.?")
+    if counted is None:
+        return None
+    lines, total = counted
+    items = []
+    for line in lines:
+        if re.fullmatch(r"Slot\s+Type\s+State(?:\s+.*)?", line, re.I):
+            continue
+        rows = parse_device_slots(line)
+        if len(rows) != 1 or rows[0]["state"].lower() not in ("master", "standby", "normal", "fault", "faulty", "absent", "abnormal", "offline"):
+            return None
+        items.extend(rows)
+    ids = [row["slot"] for row in items]
+    if not items or len(ids) != len(set(ids)) or (total is not None and total != len(items)):
+        return None  # A connected physical device cannot establish zero slots.
+    return items
+
+
+def parse_lagg_snapshot(text: str) -> dict[str, dict[str, int]] | None:
+    lines = _snapshot_lines(text, "display link-aggregation summary")
+    if lines is None:
+        return None
+    counted = _snapshot_count(lines, r"Total(?: number of)? (?:link[- ]aggregation|aggregation|LACP) groups?\s*:\s*(\d+)\.?",
+                              r"No (?:link[- ]aggregation|aggregation|LACP) groups?(?: (?:are )?configured)?\.?")
+    if counted is None:
+        return None
+    lines, total = counted
+    groups, seen = {}, set()
+    for line in lines:
+        if re.fullmatch(r"(?:Aggregation Interface Type:|(?:BAGG|RAGG|BLAGG) -- .*|Aggregation Mode:.*|Loadsharing Type:.*|"
+                        r"Actor System ID:.*|AGG\s+AGG\s+Partner ID\s+Selected\s+Unselected\s+Individual\s+Share|"
+                        r"Interface\s+Mode\s+Ports\s+Ports\s+Ports\s+Type)", line, re.I):
+            continue
+        row = parse_lagg(line)
+        if len(row) != 1:
+            return None
+        key = next(iter(row))
+        if key.casefold() in seen:
+            return None
+        seen.add(key.casefold())
+        groups.update(row)
+    if (total is not None and total != len(groups)) or (not groups and total is None):
+        return None
+    return groups
+
+
+def _hardware_snapshot(text: str, kind: str) -> list[dict[str, str]] | None:
+    lines = _snapshot_lines(text, "display " + kind)
+    if lines is None:
+        return None
+    noun = r"(?:power supplies|power supply|powers?)" if kind == "power" else r"(?:fan frames?|fan trays?|fans?)"
+    counted = _snapshot_count(lines, r"Total(?: number of)? " + noun + r"\s*:\s*(\d+)\.?",
+                              r"No " + noun + r"(?: (?:are )?(?:present|installed|configured))?\.?")
+    if counted is None:
+        return None
+    lines, total = counted
+    parser = parse_power if kind == "power" else parse_fan
+    items, slot, section_items = [], "", None
+    for line in lines:
+        header = re.fullmatch(r"Slot\s+(\d+)\s*:?", line, re.I)
+        if header:
+            if section_items == 0:
+                return None
+            slot, section_items = header.group(1), 0
+            continue
+        if re.fullmatch(r"(?:Power\s*ID|Fan\s*ID)\s+State(?:\s+.*)?", line, re.I):
+            continue
+        rows = parser(line)
+        if len(rows) != 1:
+            return None
+        rows[0]["slot"] = slot
+        items.extend(rows)
+        if section_items is not None:
+            section_items += 1
+    ids = [(row["slot"], row["id"]) for row in items]
+    if (section_items == 0 or len(ids) != len(set(ids)) or
+            (total is not None and total != len(items)) or (not items and total is None)):
+        return None
+    return items
+
+
+def parse_power_snapshot(text: str) -> list[dict[str, str]] | None:
+    return _hardware_snapshot(text, "power")
+
+
+def parse_fan_snapshot(text: str) -> list[dict[str, str]] | None:
+    return _hardware_snapshot(text, "fan")
+
+
+def parse_ospf_snapshot(text: str) -> list[dict[str, str]] | None:
+    lines = _snapshot_lines(text, "display ospf peer")
+    if lines is None:
+        return None
+    counted = _snapshot_count(lines, r"Total(?: number of)? (?:OSPF )?(?:neighbors?|peers?)\s*:\s*(\d+)\.?",
+                              r"No OSPF (?:neighbors?|peers?|process(?:es)?)(?: (?:are )?(?:configured|enabled|found))?\.?")
+    if counted is None:
+        return None
+    lines, total = counted
+    peers, area = [], ""
+    for line in lines:
+        header = re.fullmatch(r"Area\s*:\s*(\S+)", line, re.I)
+        if header:
+            area = header.group(1)
+            continue
+        if re.fullmatch(r"(?:OSPF Process \d+ with Router ID [\d.]+|Neighbors?|Neighbor Brief Information|"
+                        r"Router ID\s+Address\s+.*\bState\s+Interface)", line, re.I):
+            continue
+        rows = parse_ospf(line)
+        if (len(rows) != 1 or not OSPF_STATE_RE.fullmatch(rows[0]["state"]) or
+                valid_ip(rows[0]["router_id"]) != rows[0]["router_id"] or valid_ip(rows[0]["address"]) != rows[0]["address"]):
+            return None
+        if not line.lower().startswith("peer "):
+            tokens = line.split()
+            if len(tokens) < 6 or not re.fullmatch(r"[A-Za-z][\w./:-]*\d[\w./:-]*", tokens[-1]):
+                return None  # A table row ending at State is truncated, not complete.
+        rows[0]["area"] = area
+        peers.extend(rows)
+    ids = [(p["area"], p["router_id"], p["address"], p["interface"]) for p in peers]
+    if len(ids) != len(set(ids)) or (total is not None and total != len(peers)) or (not peers and total is None):
+        return None
+    return peers
+
+
+def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
+    """Unambiguous, individually valid rows for preserving observed faults only.
+
+    These rows must never establish a baseline or infer missing objects. Reject
+    duplicate identities and contradictory empty/count declarations before
+    allowing the evaluator to retain an explicitly observed failed state.
+    """
+    command = {"device": "display device", "lagg": "display link-aggregation summary",
+               "power": "display power", "fan": "display fan", "ospf": "display ospf peer"}[kind]
+    lines = _snapshot_lines(text, command)
+    if lines is None:
+        return []
+    rows, identities, totals = [], set(), []
+    section = ""
+    for line in lines:
+        if re.match(r"No\s+", line, re.I):
+            return []  # A no-configuration declaration cannot also prove a fault.
+        count = re.fullmatch(r"Total[^:]*:\s*(\d+)\.?", line, re.I)
+        if count:
+            value = to_int(count.group(1))
+            if value is None:
+                return []
+            totals.append(value)
+            continue
+        if kind in ("power", "fan"):
+            header = re.fullmatch(r"Slot\s+(\d+)\s*:?", line, re.I)
+            if header:
+                section = header.group(1)
+                continue
+            pattern = (r"(?:^|\b)(?:Power(?:ID)?\s*|PSU\s*|PWR\s*)?(\d+)\b" if kind == "power"
+                       else r"\bFan(?:\s+Frame|\s+Tray)?\s*(\d+)\b")
+            candidate = re.search(pattern, line, re.I) if kind == "fan" else re.match(pattern, line, re.I)
+            parsed = (parse_power if kind == "power" else parse_fan)(line)
+            for row in parsed:
+                row["slot"] = section
+        elif kind == "device":
+            candidate = re.match(r"(?:Slot\s+)?(\d+)\b", line, re.I)
+            parsed = parse_device_slots_snapshot(line) or []
+        elif kind == "lagg":
+            candidate = re.match(r"((?:BAGG|RAGG|BLAGG|Bridge-Aggregation|Route-Aggregation|Blade-Aggregation)\d+)\b", line, re.I)
+            parsed = [{"group": name, **values, "line": line} for name, values in parse_lagg(line).items()]
+        else:
+            header = re.fullmatch(r"Area\s*:\s*(\S+)", line, re.I)
+            if header:
+                section = header.group(1)
+                continue
+            candidate = re.match(r"(?:Peer\s+)?([\d.]+)\b", line, re.I)
+            parsed = parse_ospf_snapshot(line) or []
+            for row in parsed:
+                row["line"] = line
+        if candidate is None:
+            continue
+        identity = (section, candidate.group(1).casefold())
+        if identity in identities:
+            return []
+        identities.add(identity)
+        rows.extend(parsed)
+    if len(set(totals)) > 1 or (totals and totals[0] < len(identities)):
+        return []
+    return rows
 
 
 # --------------------------------------------------------------------------- Aruba MM / WLC

@@ -1,0 +1,3 @@
+Slot Type             State    Subslot  Soft Ver             Patch Ver
+1    SyntheticSwitch  Master   0        synthetic            None
+2    SyntheticSwitch

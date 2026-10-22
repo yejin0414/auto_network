@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .config import CREDENTIAL_PROFILES, ConfigError
-from .credentials import Credential
+from .config import CREDENTIAL_PROFILES, ConfigError, validate
+from .credentials import CredentialError
 from .engine import Engine
 from .instance import APP_ID
 from .report import render
@@ -47,6 +47,8 @@ class App:
         with self._config_lock:
             cfg = self.engine.cfg.get()
             background = dict(self.background)
+            credentials = self.engine.creds.status()
+            storage_uncertain = self.engine.creds.storage_uncertain
         return {
             "config": cfg,
             "version": self.version,
@@ -56,7 +58,8 @@ class App:
             "background": background,
             "web_mode": self.web_mode,
             "engine": self.engine.status(),
-            "credentials": self.engine.creds.status(),
+            "credentials": credentials,
+            "credential_storage_uncertain": storage_uncertain,
             "credential_profiles": CREDENTIAL_PROFILES,
             "keyring": self.engine.creds.keyring_available,
             "baseline_times": self.engine.store.baseline_times(),
@@ -144,36 +147,37 @@ class App:
         if path == "/api/check":
             started = eng.start_check("manual")
             return (202, {"started": True}) if started else (409, {"error": "이미 점검이 진행 중입니다."})
-        if path == "/api/credentials":
-            profile = body.get("profile")
-            if profile not in CREDENTIAL_PROFILES and profile not in ("backbone", "aruba"):
-                return 400, {"error": "알 수 없는 계정 종류입니다."}
-            if body.get("clear"):
-                eng.creds.clear(profile)
-                return 200, {"ok": True}
-            user = str(body.get("username", "")).strip()
-            pw = str(body.get("password", ""))
-            if not user or not pw:
-                return 400, {"error": "아이디와 비밀번호를 모두 입력하세요."}
-            note = eng.creds.set(profile, Credential(user, pw), bool(body.get("remember")))
-            return 200, {"ok": True, "note": note}
-        if path == "/api/config":
+        if path in ("/api/config", "/api/credentials", "/api/settings"):
             with self._config_lock:
                 if self._closing:
                     return 503, {"error": "프로그램을 종료 중이므로 설정을 저장할 수 없습니다."}
+                has_config = path != "/api/credentials"
                 try:
-                    cfg = eng.cfg.save(body)
+                    cfg = validate(body if path == "/api/config" else body.get("config")) if has_config else None
+                    changes = body.get("credentials", []) if path == "/api/settings" else [body]
+                    if path == "/api/config":
+                        cfg = eng.cfg.save(cfg)
+                    else:
+                        cfg = eng.creds.apply(changes, (lambda: eng.cfg.save(cfg)) if has_config else None)
+                except CredentialError as exc:
+                    return 503, {"error": str(exc), "rollback_failed": exc.rollback_failed}
                 except ConfigError as exc:
                     return 400, {"error": str(exc)}
-                except (TypeError, ValueError) as exc:
-                    return 400, {"error": f"설정 값을 확인하세요: {exc}"}
-                eng.reschedule()
-                if self.on_config_saved:
+                except (TypeError, ValueError):
+                    return 400, {"error": "설정 또는 계정 입력 형식이 올바르지 않습니다. 입력 값을 확인하세요."}
+                except OSError:
+                    return 500, {"error": "설정 파일을 저장하지 못했습니다. 기존 설정과 계정을 유지했습니다."}
+                if has_config:
                     try:
-                        self.on_config_saved(cfg)
+                        eng.reschedule()
+                        if self.on_config_saved:
+                            self.on_config_saved(cfg)
                     except Exception:  # pragma: no cover
                         log.exception("설정 저장 후 처리 실패")
-            return 200, {"ok": True, "config": cfg}
+                payload = {"ok": True, "config": cfg} if has_config else {"ok": True, "note": None}
+                if path != "/api/config":
+                    payload["credentials"] = eng.creds.status()
+                return 200, payload
         if path == "/api/vrrp/ack":
             # 확인 · 초기화: 미확인 VRRP 변경을 확인 처리하고 그 백본의 VRRP 기준값만 지움 → 다음 점검부터 '역할 변화' 표시 없음
             devs = eng.store.ack_vrrp(body.get("device") or None)
