@@ -58,11 +58,11 @@ class Sheet:
     def __init__(self, ws, title: str, headers: list[tuple[str, int]], subtitle: str = "") -> None:
         self.ws = ws
         ws.sheet_view.showGridLines = False
-        ws["A1"] = title
+        ws["A1"] = ILLEGAL.sub("", title)
         ws["A1"].data_type = "s"
         ws["A1"].font = Font(name=FONT, size=14, bold=True, color=INK)
         if subtitle:
-            ws["A2"] = subtitle
+            ws["A2"] = ILLEGAL.sub("", subtitle)
             ws["A2"].data_type = "s"
             ws["A2"].font = Font(name=FONT, size=9, color="5D6879")
         self.hrow = 4
