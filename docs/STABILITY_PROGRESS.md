@@ -18,9 +18,9 @@
 전체 진행률 = 검증까지 완료된 작업 가중치 합계 / 확정된 전체 가중치 합계 × 100.
 
 - 전체 작업: 9개, 가중치 합계: 100%.
-- 현재 완료: 7개, 진행 중: 0개, 대기: 1개, 보류: 1개, 실패: 0개.
-- 현재 진행률: **80.0%** ((S-01 15 + S-02 20 + S-03 15 + S-05 10 + S-06 10 + S-07 5 + S-08 5) / 100). S-08 완료 증가: **+5.0%p**.
-- 진행률: `[████████████████░░░░] 80.0%` (한 칸 5%p).
+- 현재 완료: 8개, 진행 중: 0개, 대기: 0개, 보류: 1개, 실패: 0개.
+- 현재 진행률: **85.0%** ((S-01 15 + S-02 20 + S-03 15 + S-05 10 + S-06 10 + S-07 5 + S-08 5 + S-09 5) / 100). S-09 완료 증가: **+5.0%p**.
+- 진행률: `[█████████████████░░░] 85.0%` (한 칸 5%p).
 - 로컬 재현 및 테스트 통과만으로 완료 처리하지 않는다. 변경 코드에 대한 실제 GitHub Actions 성공 근거가 필요하다.
 - 미검증, 진행 중, 보류 작업은 완료 가중치에 포함하지 않는다.
 - 이 기록을 새 세션에서 읽을 때 실제 Commit, PR, Actions 상태를 대조한다. 완료 작업을 중복 계산하거나 진행률을 임의로 초기화하지 않는다.
@@ -38,7 +38,7 @@
 | S-06 | UI 이력 응답 역전 및 일시 조회 실패 복구 | Medium | 10% | 완료 | Actions 39810972763 전체 성공, Node UI15개/기존 설정/Python381개/EXE 검증 통과 |
 | S-07 | Excel 제목/부제의 제어 문자 방어 | Medium | 5% | 완료 | Actions 39814068606 전체 성공, 신규 Excel6개/Python387개/EXE 검증 통과 |
 | S-08 | 비정상 보고서 ID/토큰 예외 처리 | Low | 5% | 완료 | Actions 39818540896 전체 성공, 신규 HTTP11개/Python398개/EXE 검증 통과 |
-| S-09 | 최종 기능 보존 및 Windows 실행 검증 | Low | 5% | 대기 | 미실행 |
+| S-09 | 최종 기능 보존 및 Windows 실행 검증 | Low | 5% | 완료 | 최종 코드 Actions 39818540896 성공 + 전체 제품/테스트 blob 동일성 + 누적 기능 보존 대조 |
 
 가중치 변경 내역: 없음. 기존 이전/개선 작업은 이 계획의 완료 가중치로 다시 계산하지 않는다.
 
@@ -147,7 +147,7 @@
 - 방법: 변환/토큰 비교 경계만 방어한다. 기존 API의 입력 오류 400 정책을 보고서 ID에도 적용하고, 보고서의 403/404/503 및 `/api/bye`의 잘못된 종료 신호 무시/204 정책을 보존한다. SQLite 범위 초과는 보고서 조회 호출만 감싸 OverflowError를 처리한다. 렌더러나 다른 DB 오류를 400으로 재분류하지 않는다.
 - 기능 변경 위험: Low. 정상 API/파일 형식과 종료 기능은 동일하다.
 - 테스트: 잘못된 ID, 비 ASCII/누락/잘못된 토큰, 정상 다운로드, 종료 콜백 부작용 없음, DB 오류 응답.
-- 완료 조건: 예외가 밖으로 나오지 않고 정상 API 회귀 및 CI가 통과한다.
+- 완료 조건: 대상 비정상 보고서 ID/토큰 예외가 요청 처리 밖으로 나오지 않고 정상 API 회귀 및 CI가 통과한다.
 - 가중치: 5%.
 
 ### S-09 — 최종 기능 보존 및 Windows 실행 검증
@@ -162,7 +162,7 @@
 
 ## 기능 보존 체크리스트
 
-| 기존 기능 | 누적 확인 방법 | S-08 코드 Actions 누적 확인 상태 |
+| 기존 기능 | 누적 확인 방법 | S-09 최종 대조 상태 (검증 코드 S-08) |
 |---|---|---|
 | BB/MM/WLC 명령과 결과 | 명령/collector/evaluate 변경 없음, 기존 전체 CI | CI Mock/Fixture 검증 통과 |
 | CPU/메모리 및 임계값 | parser/evaluate 변경 없음, Fixture 테스트 | CI 통과 |
@@ -170,7 +170,7 @@
 | WLC 클러스터/Client 분배 | 기존 cluster 회귀 | CI 통과 |
 | 정상/주의/장애/확인 불가 표시 | 판정/표시 문구 보존, 기존 회귀 | CI 통과 |
 | 이력/기준값/DB 호환성 | 스키마 보존, 이력 조회 snapshot 및 DB/대용량/복원 회귀 | CI 통과, 실제 사용 DELETE 동시 정리 검증 통과 |
-| Excel/HTML 보고서 | 생성 모듈/형식 보존, 원본 snapshot·과거 context 회귀 | 신규/기존 테스트 및 EXE Excel 저장/내려받기 통과 |
+| Excel/HTML 보고서 | 정상 생성 결과/형식 보존, 원본 snapshot·과거 context 회귀 | 신규/기존 테스트 및 EXE Excel 저장/내려받기 통과 |
 | 자동 점검/Windows 작업 스케줄러 | 기존 Windows 작업 검사 | CI 통과, 장시간 운영/절전 복귀 미검증 |
 | 인증 정보/기존 저장 형식 | Mock 조회 오류/정상 이전/저장 보상 복구 | CI 및 EXE 저장/재시작 검증 통과 |
 | 웹 UI/좁은 화면 | HTML/CSS 보존, 실제 JS 요청 경합 및 기존 UI/창 검사 | 신규 Node15개/기존 설정/창 CI 통과, 별도 모바일 기기/좁은 화면 수동 검증 미실행 |
@@ -264,7 +264,8 @@ python -m unittest tests.test_engine_timeouts tests.test_timeouts tests.test_clu
 - S-02의 수정 및 Windows Actions 검증을 완료했다. 종료에 응답하지 않는 실제 일반 worker/helper는 강제 제거하지 않고 슬롯을 계속 점유한다. 이 경우 후속 미시도 장비는 기존 '확인 불가'로 기록하며, 실행 슬롯이 실제 해제되면 다음 점검에서 복구한다. 기존 클러스터 fallback은 변경하지 않았다.
 - S-03의 이력/보고서 읽기 일관성 수정과 Windows Actions 검증을 완료했다. Excel용 단일 회차의 압축 원문은 보고서 처리 동안 메모리에 유지되며, 일반 조회에는 추가하지 않는다. S-05의 진단 수신 한도/자원 정리와 S-06의 UI 응답 경합도 Windows Actions 검증을 완료했다. S-07의 Excel 제목/부제 문자 방어와 S-08의 보고서 ID/토큰 입력 경계도 Windows Actions 검증을 완료했다.
 - S-04는 잘못된 수치를 어떤 상태로 표시할지 별도 승인 전까지 수정하지 않는다.
-- 다음 승인 작업은 S-09(가중치 5%, Low), 누적 기능 보존 및 Windows 실행 최종 검증이다. 실제 전체 CI 성공 코드와 후속 문서 Commit의 제품/테스트 blob 동일성을 확인한다. S-04 보류를 유지하며 한 번에 하나씩 진행한다. 각 작업 전 실제 기준과 중복 변경 여부를 확인하고 Commit/PR/검증 근거를 이 문서에 이어 기록한다.
+- S-09의 누적 기능 보존/Windows 최종 검증도 완료했다. 검증된 최종 제품 코드와 후속 문서 Commit의 제품/테스트 blob이 동일하다. 현재 승인 범위에서 대기 중인 작업은 없으며 다음 잔여 작업 S-04는 비정상 수치 처리 방침을 별도로 승인받은 뒤 착수한다. S-04 변경 이후에는 누적 Windows CI를 다시 확인하되 S-09의5%를 중복 가산하지 않는다.
+- 승인 범위 밖 잔여 위험: 일반 `/api/run`에 SQLite 정수 범위 밖 ID를 직접 보내면 OverflowError가 남는다. S-08의 보고서 ID/토큰 경계 밖이므로 별도 후속 범위 결정 대상으로 기록하며 이번9개 작업/100% 가중치에 임의로 추가하지 않는다.
 
 ## S-03 실행 기록
 
@@ -462,3 +463,62 @@ python -m unittest tests.test_diagnose_limits tests.test_diagnose_resources test
 **S-08 완료 판정:** 실제 변경 Commit의 전체 Windows Actions 성공으로5%를 반영한다. 완료7개, **80.0%**, 이전 대비 **+5.0%p**, 잔여2개/20%다. S-04는 별도 방침 승인 전 보류하며 다음 승인 작업S-09로 계속한다. 작업/가중치 변경은 없다.
 
 후속 완료 기록 Commit은 이 문서만 변경한다. 제품/테스트는 위 코드 Commit의 blob과 동일하게 유지하며 문서 Commit의 추가 CI 성공을 확인 없이 주장하지 않는다. 일반 `/api/run`의 범위 밖 정수 ID 예외는 승인 범위 밖 후속 위험으로 남긴다.
+
+## S-09 실행 기록 — 최종 기능 보존 및 Windows 검증
+
+### 기준, 범위와 코드 동일성
+
+- S-08의 실제 Actions 성공과 완료 기록 이후, 계속 진행 승인 범위에서 한 작업으로 착수했다. 시작 Commit `29c52d79b6429046838791de79baf8a84be995d5`, Tree `37efdc0a3a3ee2d61008cb54a9c4c4b252d75303`다. 원격 PR #8은 `open`, `draft=true`, `merged=false`였으며 base/main은 최초 `bc413434f76068ee443d620a65ba0d622d867cc2`를 유지했다.
+- 최종 제품 코드 Commit은 `170f50f54761cfc601641cb04edec283f8bf28d4`, Tree `24cc991fab23dbc448be1802cd6b977b3a80b5f9`다. 이 코드와 S-08 완료 기록의 원격 전체 Tree를 비교해122개 blob 중 진행 문서1개만 변경되고 나머지121개가 동일함을 확인했다. 코드·테스트·Fixture·workflow·의존성 선언은 실제 CI 검증 대상 그대로다.
+- 이번 S-09 변경 파일은 `docs/STABILITY_PROGRESS.md` 하나다. 제품 코드나 테스트를 새로 바꾸지 않았으므로 동일 코드의 검증을 반복 실행하지 않았다. 실제 최종 코드 CI의 성공과 전체 blob 동일성을 사용한 검증이며 새 실행을 했다고 주장하지 않는다. 이 절의 문서 Commit은 [PR #8의 Commit 이력](https://github.com/yejin0414/auto_network/pull/8/commits)에서 추적한다.
+- 최초 main의 원격113개 파일에서 최종122개 파일로 늘었다. 수정11개(제품7개,기존 테스트4개),추가9개(새 테스트8개,진행 문서1개),삭제0개,기존 파일 mode 변경0개다. 기존102개 blob은 바이트 단위로 동일하다. 로컬 텍스트 사본도 원격 Git blob과 대조했다. 로컬에 내려받지 않은 아이콘2개는 원격 blob 동일성으로 확인했으며 로컬 검증으로 표현하지 않는다.
+- 제품 변경7개는 `nc/credentials.py`, `nc/engine.py`, `nc/store.py`, `nc/diagnose.py`, `web/app.js`, `nc/excel.py`, `nc/server.py`다. 모두 앞선 작업의 재현 근거/최소 수정/회귀 검증으로 추적되며 S-09에서 변경 범위를 늘리지 않았다.
+
+### 누적 기능 보존 대조
+
+| 확인 대상 | 시작 기준 대비 보존 근거 | 실제 최종 CI 검증 근거 |
+|---|---|---|
+| BB/MM/WLC 명령·SSH/Telnet·정상 수집 | `commands.py`, `collector.py` 전체 blob 동일; 정상 수집 명령/호출 유지 | `test_e2e_ssh`, `test_backbone_access`, 정상 순서/명령/결과를 포함한 `test_engine_timeouts` |
+| CPU/메모리·VRRP/OSPF/LACP/인터페이스·상태 판정 | `parsers.py`, `evaluate.py`, 설정 파일 및 기존26개 Fixture 동일 | `test_parsers`, `test_optional_command_accuracy`, `test_vrrp_accuracy`, `test_vrrp_stability`, 기존 collection 판정 회귀 |
+| WLC 클러스터·Client 분배 | 관련 명령/파서/판정 동일, Engine cluster 함수 AST 동일 | `test_cluster_fallback`, `test_cluster_source_reports` |
+| 이력·기준값·기존 DB | Store SCHEMA 문자열1934bytes 동일; 초기화·저장·commit·기준값·VRRP·prune 메서드 AST 동일 | `test_baseline_lifecycle`, `test_sqlite_faults`, `test_read_snapshots`, `test_store_recovery`, 합성1GiB DB·복원29단계 |
+| Excel/HTML 및 과거 기준 | HTML/report_context 모듈 동일; Excel 제목/부제 금지 문자 처리 두 줄과 일관된 원문 snapshot만 변경 | `test_report_snapshots`, `test_report_capture`, `test_report_read_snapshots`, `test_excel_text_safety`, 실제 EXE 저장/내려받기 |
+| 인증 정보·저장 형식 | 조회 실패 분기 외 기존 shared/legacy 우선순위·형식·apply 보상 복구 유지 | `test_account`, `test_settings_transaction`, Windows 계정 저장/가짜 SSH/재시작 검증 |
+| 자동 점검·Windows 예약 작업 | 일정 계산 함수와 `schedule_sync.py`, `wintask.py` 동일 | `test_schedule`, `test_scheduler_refresh`, `test_schedule_sync`, `windows_task_check.py`의 등록/주기 변경/닫힌 창 상태 `schtasks /Run` |
+| 정상 API·보고서 다운로드·종료 | 기존 경로 문자열29개 집합 동일; 정상 ID/토큰/헤더와403/404/503/bye204 보존 | 신규 `test_http_input_safety`11개와 기존 API/저장/보고서 회귀 |
+| 웹 UI·상태 문구·설정 흐름 | HTML/CSS·렌더 함수·상태 문구·기존 poll 간격 보존; JS 응답 적용 경계만 보강 | Node history UI15개, 기존 settings UI, Windows 창 검사 |
+| Windows EXE·빌드·백업/복원 | `app.py`, 창/instance/notify, DB 유지보수/전송/파일 발행, workflow/requirements/tools 동일 | EXE 빌드·Demo·계정/보상 복구·백업/복원·중복 실행/포트 독점·창/종료·Excel·예약 작업 |
+
+Store SCHEMA의 동일 SHA-256은 `3822940824c7d49dba08b02d77a5d50aff92bed3d3c45299586372ccabe00b2a`다. 의존성 선언과 기존 설치 절차를 보존했다는 의미이며, 서로 다른 실행 시점에 설치된 모든 패키지의 실제 버전이 같았다고 확대하지 않는다.
+
+### 실제 CI와 보관 근거
+
+- [최종 코드 Actions 39818540896](https://github.com/yejin0414/auto_network/actions/runs/39818540896), [Job119963319434](https://github.com/yejin0414/auto_network/actions/runs/39818540896/job/119963319434): 정확한 코드 SHA, Run/Job `completed/success`,22개 단계 모두 성공을 다시 확인했다. Python3.12.10/SQLite3.49.1의 **398개,188.864초,OK(skipped=4)**, 신규 HTTP11개 개별ok,Node UI15개/기존 설정 PASS,합성1GiB DB29개 phase PASS다.
+- 단계4의 공개 소스122개 검사, 단계6의 실제 Node UI, 단계8의 전체 Python/MockSSH, 단계9의 DB, 단계10–15의 EXE/Windows 실행과 단계16–18의 ZIP 검증/artifact/로그 보관을 확인했다. Mock/Fixture/Demo/폐기 가능한 Windows 환경만 사용했다.
+- [Windows-validation-logs](https://github.com/yejin0414/auto_network/actions/runs/39818540896/artifacts/12444580909): artifact ID12444580909,18229bytes. [NetcheckCenter_windows](https://github.com/yejin0414/auto_network/actions/runs/39818540896/artifacts/12443598669): ID12443598669,21616027bytes. 두 artifact의 코드 SHA가 최종 검증 코드와 같고 조회 당시 미만료이며 보존 만료일은2026-11-05다. 핵심 검증 수치·Commit·제한은 만료되는 artifact와 별도로 이 Git 문서에 남긴다.
+- S-08 완료 문서 Commit의 별도 [Actions39846598182](https://github.com/yejin0414/auto_network/actions/runs/39846598182)는 기록 시 `in_progress`,conclusion=null이었다. 이 추가 실행이나 이후 S-09 문서 Commit의 CI를 성공으로 계산하지 않았다. 완료 근거는 이미 최종 성공한 제품 코드 CI와 문서 외 모든 blob의 동일성이다.
+- 독립 검토는 누적 제품 diff/기능 보존, CI/Windows 근거, 진행률/Commit 기록을 나누어 읽기 전용으로 수행했다. 새 차단 결함이나 승인 범위 밖 정상 기능 변경은 발견하지 못했다. 문서의 Excel 설명을 '정상 생성 결과/형식 보존'으로 명확히 하고 S-08 완료 조건을 대상 ID/토큰 예외로 한정해 내부 오류 은폐로 오해하지 않게 했다.
+
+### 완료 근거 연결
+
+| 작업 | 코드 Commit | 실제 성공한 Actions | 당시 전체 Python 테스트 |
+|---|---|---|---:|
+| S-01 | `dea5d326cb12e2f8ee008ffdbd1cc63f65ef3133` | [39786408187](https://github.com/yejin0414/auto_network/actions/runs/39786408187) | 330 |
+| S-02 | `44a8e91a729c5a3e90d404a95e67aaee5f16818e` | [39793991393](https://github.com/yejin0414/auto_network/actions/runs/39793991393) | 345 |
+| S-03 | `b45da0308279266a825e716de49ca5f61348937e` | [39801880979](https://github.com/yejin0414/auto_network/actions/runs/39801880979) | 363 |
+| S-05 | `2027ef60d6e6c4be1f122ada32e8434fc87b2b14` | [39806415444](https://github.com/yejin0414/auto_network/actions/runs/39806415444) | 381 |
+| S-06 | `7e981420ede6d0465f0f854d1a2689885f9cea00` | [39810972763](https://github.com/yejin0414/auto_network/actions/runs/39810972763) | 381 + 별도 Node15 |
+| S-07 | `b114b28d14b3eb343932376c6037ed87eae77990` | [39814068606](https://github.com/yejin0414/auto_network/actions/runs/39814068606) | 387 |
+| S-08 / S-09 최종 코드 | `170f50f54761cfc601641cb04edec283f8bf28d4` | [39818540896](https://github.com/yejin0414/auto_network/actions/runs/39818540896) | 398 + 별도 Node15 |
+
+S-09는 위 검증을 새 테스트 실행으로 중복 보고하지 않고 누적 코드/기능 보존·원격 동일성·기록 대조의 승인된5%만 반영한다. 기존 F01–F34,PR #2–#7,후속 문서 Commit의 추가 CI도 완료 가중치에 중복 반영하지 않는다.
+
+### 남은 위험과 재개 조건
+
+- **S-04 보류/15%:** 매우 긴 uptime 수치 변환 예외가 전체 실행 결과 저장을 막을 수 있다. 해당 지표만 '확인 불가'로 격리하는 방침은 기존 판정 결과에 영향을 줄 수 있어 별도 승인 전 적용하지 않는다. 승인 뒤 정상 Fixture/임계값/다른 지표·장비 결과 보존 및 누적 Windows CI를 검증해야 한다.
+- 일반 `/api/run`의 SQLite 정수 범위 밖 직접 ID 요청 예외는 이번 확정 계획 밖 잔여 위험이다. 새 작업과 가중치는 승인 없이 추가하지 않는다.
+- 종료되지 않는 일반 worker/helper를 강제 제거하지 않는 제한과 단일 Excel 회차의 압축 원문 메모리 보유는 앞선 작업 기록대로 유지한다. 성공한 Mock 검증을 모든 OS/장비의 자원 회수 보장으로 확대하지 않는다.
+- Windows에서 WAL 하위 조건4개는 기존 SQLite 정책상 skip이고 실제 DELETE 검증은 PASS다. 로컬 WAL 성공을 Windows WAL 성공으로 표시하지 않는다. 실제 화면 toast는 NOT_RUN이며 운영 장비·장시간 예약/절전 복귀·물리 모바일 기기/좁은 화면 수동 검증은 미실행이다.
+- main 직접 수정,원본 저장소 접근/동기화,운영 장비 접속,PR 병합,릴리스 생성,배포는 수행하지 않았다. PR #8은 검토용 Draft다.
+
+**S-09 완료 판정:** 실제 최종 코드의 전체 Windows Actions 성공, 기능 보존 대조, 제품/테스트 동일성, Commit/PR/미검증 기록 조건을 충족했다. 완료8개·보류1개·진행 중0개·대기0개·실패0개, **85.0%**, 이전 대비 **+5.0%p**다. 잔여1개/15%는S-04이며 작업과 가중치 변경은 없다. 이번 승인 범위에서 추가로 진행 가능한 대기 작업은 없고 전체 계획 완료나 무결함을 선언하지 않는다.
