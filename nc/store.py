@@ -18,17 +18,21 @@ from typing import Any
 from uuid import uuid4
 
 from .report_context import capture_context, normalize_context
+from .file_publish import publish_new_file
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started REAL NOT NULL, finished REAL, trigger TEXT, overall TEXT, summary TEXT, report_context TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_runs_started ON runs(started);
 CREATE TABLE IF NOT EXISTS device_results (
   run_id INTEGER NOT NULL, device_id TEXT NOT NULL, status TEXT, cpu REAL, mem REAL, data TEXT,
   PRIMARY KEY (run_id, device_id)
 );
 CREATE INDEX IF NOT EXISTS ix_dr_device ON device_results(device_id, run_id);
+CREATE INDEX IF NOT EXISTS ix_dr_uptime ON device_results(device_id, run_id DESC)
+  WHERE json_extract(data,'$.metrics.uptime') IS NOT NULL;
 CREATE TABLE IF NOT EXISTS raw_outputs (
   run_id INTEGER NOT NULL, device_id TEXT NOT NULL, cmd_id TEXT NOT NULL,
   label TEXT, command TEXT, ok INTEGER, error TEXT, duration REAL, output BLOB,
@@ -41,10 +45,14 @@ CREATE TABLE IF NOT EXISTS vrrp_history (
   source TEXT, text TEXT, acked REAL
 );
 CREATE INDEX IF NOT EXISTS vrrp_history_dev ON vrrp_history(device_id, acked);
+CREATE INDEX IF NOT EXISTS ix_vrrp_order ON vrrp_history(COALESCE(log_ts, detected) DESC, id DESC);
+CREATE INDEX IF NOT EXISTS ix_vrrp_text ON vrrp_history(device_id, text);
+CREATE INDEX IF NOT EXISTS ix_vrrp_unacked ON vrrp_history(acked, device_id) WHERE acked IS NULL;
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, run_id INTEGER, device_id TEXT,
   level TEXT, kind TEXT, text TEXT
 );
+CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS inventory_state (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, devices TEXT
 );
@@ -288,9 +296,15 @@ class Store:
     def previous_metrics(self) -> dict[str, dict]:
         """장비별 가장 최근 회차의 지표(재부팅 감지용)."""
         rows = self._q(
-            "SELECT dr.device_id, dr.data, r.started FROM device_results dr JOIN runs r ON r.id=dr.run_id "
-            "WHERE dr.run_id=(SELECT MAX(run_id) FROM device_results x WHERE x.device_id=dr.device_id "
-            "AND json_extract(x.data,'$.metrics.uptime') IS NOT NULL)"
+            # Iterate devices with an uptime sample once, then seek their newest
+            # non-null sample. The partial index excludes failed/empty samples.
+            "SELECT dr.device_id, dr.data, r.started FROM "
+            "(SELECT DISTINCT device_id FROM device_results "
+            "WHERE json_extract(data,'$.metrics.uptime') IS NOT NULL) d "
+            "JOIN device_results dr ON dr.device_id=d.device_id AND dr.run_id="
+            "(SELECT MAX(x.run_id) FROM device_results x WHERE x.device_id=d.device_id "
+            "AND json_extract(x.data,'$.metrics.uptime') IS NOT NULL) "
+            "JOIN runs r ON r.id=dr.run_id"
         )
         out = {}
         for r in rows:
@@ -302,14 +316,17 @@ class Store:
 
     def trend(self, device_id: str, since: float) -> list[dict]:
         rows = self._q(
-            "SELECT r.started, dr.status, dr.cpu, dr.mem FROM device_results dr JOIN runs r ON r.id=dr.run_id "
+            # Select the requested time window before reading device history.
+            "SELECT r.started, dr.status, dr.cpu, dr.mem FROM runs r INDEXED BY ix_runs_started "
+            "JOIN device_results dr ON r.id=dr.run_id "
             "WHERE dr.device_id=? AND r.started>=? ORDER BY r.id", (device_id, since))
         return [{"t": r["started"], "status": r["status"], "cpu": r["cpu"], "mem": r["mem"]} for r in rows]
 
     def trends_all(self, since: float) -> dict[str, list]:
         rows = self._q(
-            "SELECT dr.device_id, r.id, r.started, dr.status, dr.cpu, dr.mem FROM device_results dr "
-            "JOIN runs r ON r.id=dr.run_id WHERE r.started>=? ORDER BY r.id", (since,))
+            "SELECT dr.device_id, r.id, r.started, dr.status, dr.cpu, dr.mem "
+            "FROM runs r INDEXED BY ix_runs_started JOIN device_results dr ON r.id=dr.run_id "
+            "WHERE r.started>=? ORDER BY r.id", (since,))
         out: dict[str, list] = {}
         for r in rows:
             out.setdefault(r["device_id"], []).append({"run": r["id"], "t": r["started"], "status": r["status"], "cpu": r["cpu"], "mem": r["mem"]})
@@ -533,7 +550,7 @@ class Store:
             destination = self.backup_directory / f"{self.path.stem}-backup-{stamp}-{uuid4().hex}.sqlite3"
         destination = Path(destination).absolute()
         forbidden = {self.path, *(Path(str(self.path) + suffix) for suffix in ("-wal", "-shm", "-journal"))}
-        if destination.resolve() in forbidden or any(
+        if destination.resolve() in forbidden or str(destination).lower().endswith(("-wal", "-shm", "-journal")) or any(
                 os.path.lexists(str(destination) + suffix) for suffix in ("", "-wal", "-shm", "-journal")):
             raise FileExistsError("기존 파일이나 사용 중인 데이터베이스에 백업을 덮어쓸 수 없습니다.")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -541,38 +558,45 @@ class Store:
         fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
         os.close(fd)
         temporary = Path(name)
-        target = None
+        source = target = None
         try:
             if not self._lock.acquire(timeout=_remaining(deadline)):
                 raise TimeoutError("SQLite 저장 작업 대기 시간을 초과했습니다.")
             try:
                 if self._db.in_transaction:
                     raise ValueError("완료되지 않은 SQLite 트랜잭션 중에는 백업할 수 없습니다.")
-                busy_timeout = self._db.execute("PRAGMA busy_timeout").fetchone()[0]
-                self._db.execute("PRAGMA busy_timeout=0")
-                try:
-                    target = sqlite3.connect(str(temporary), timeout=0)
-
-                    def progress(_status, _remaining_pages, _total_pages):
-                        _remaining(deadline)
-
-                    self._db.backup(target, pages=128, progress=progress, sleep=0.05)
-                    _remaining(deadline)
-                    target.execute("PRAGMA journal_mode=DELETE").fetchall()
-                    _validate_connection(target, deadline)
-                finally:
-                    self._db.execute(f"PRAGMA busy_timeout={int(busy_timeout)}")
             finally:
                 self._lock.release()
+            # A separate read-only connection lets SQLite's online backup API
+            # release source locks between steps. Do not monopolize the shared
+            # application connection during copying or destination validation.
+            source = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0)
+            source.execute("PRAGMA query_only=ON")
+            target = sqlite3.connect(str(temporary), timeout=0)
+
+            def progress(_status, _remaining_pages, _total_pages):
+                _remaining(deadline)
+
+            source.backup(target, pages=128, progress=progress, sleep=0.05)
+            source.close()
+            source = None
+            _remaining(deadline)
+            target.execute("PRAGMA journal_mode=DELETE").fetchall()
+            _validate_connection(target, deadline)
             target.close()
             target = None
             with temporary.open("r+b") as handle:
                 os.fsync(handle.fileno())
             _remaining(deadline)
-            # A hard link is atomic and exclusive. A check followed by replace()
-            # would overwrite a file created by another process in between.
-            os.link(temporary, destination)
+            if any(os.path.lexists(str(destination) + suffix) for suffix in ("-wal", "-shm", "-journal")):
+                raise FileExistsError("백업 대상에 SQLite 보조 파일이 생겨 확정하지 않았습니다.")
+            publish_new_file(temporary, destination)
         finally:
+            if source is not None:
+                try:
+                    source.close()
+                except sqlite3.Error as exc:
+                    log.warning("백업 원본 읽기 연결 정리 실패: %s", exc)
             if target is not None:
                 try:
                     target.close()
@@ -598,10 +622,10 @@ class Store:
     def prune(self, days: int) -> None:
         cutoff = time.time() - days * 86400
         with self._lock, self._db:
-            old = [r[0] for r in self._db.execute("SELECT id FROM runs WHERE started<?", (cutoff,)).fetchall()]
-            for rid in old:
-                for t in ("raw_outputs", "device_results"):
-                    self._db.execute(f"DELETE FROM {t} WHERE run_id=?", (rid,))
-                self._db.execute("DELETE FROM runs WHERE id=?", (rid,))
+            # Keep one transaction and a fixed number of statements regardless
+            # of the number of expired runs; retain runs until both child deletes.
+            for table in ("raw_outputs", "device_results"):
+                self._db.execute(f"DELETE FROM {table} WHERE run_id IN (SELECT id FROM runs WHERE started<?)", (cutoff,))
+            self._db.execute("DELETE FROM runs WHERE started<?", (cutoff,))
             self._db.execute("DELETE FROM events WHERE ts<?", (cutoff,))
             self._db.execute("DELETE FROM vrrp_history WHERE COALESCE(log_ts, detected)<? AND acked IS NOT NULL", (cutoff,))

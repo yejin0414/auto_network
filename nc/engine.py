@@ -101,8 +101,8 @@ class Engine:
             return self.store.sync_inventory(cfg if cfg is not None else self.cfg.get())
 
     def backup_database(self) -> Path:
-        with self.persistence_lock:
-            return self.store.backup()
+        # Backups contain the transaction-consistent DB, not live configuration.
+        return self.store.backup()
 
     # ------------------------------------------------------------- 점검
     def start_check(self, trigger: str = "manual") -> bool:
