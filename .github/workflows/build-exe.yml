@@ -37,6 +37,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
+          python -c "import sys, sqlite3; print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
 
       - name: 테스트 (파서 + 가짜 SSH 장비 종단 테스트)
         shell: pwsh
