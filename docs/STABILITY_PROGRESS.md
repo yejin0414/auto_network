@@ -18,9 +18,9 @@
 전체 진행률 = 검증까지 완료된 작업 가중치 합계 / 확정된 전체 가중치 합계 × 100.
 
 - 전체 작업: 9개, 가중치 합계: 100%.
-- 현재 완료: 5개, 진행 중: 1개, 대기: 2개, 보류: 1개, 실패: 0개.
-- 현재 진행률: **70.0%** ((S-01 15 + S-02 20 + S-03 15 + S-05 10 + S-06 10) / 100). S-06 완료 증가: **+10.0%p**.
-- 진행률: `[██████████████░░░░░░] 70.0%` (한 칸 5%p).
+- 현재 완료: 6개, 진행 중: 0개, 대기: 2개, 보류: 1개, 실패: 0개.
+- 현재 진행률: **75.0%** ((S-01 15 + S-02 20 + S-03 15 + S-05 10 + S-06 10 + S-07 5) / 100). S-07 완료 증가: **+5.0%p**.
+- 진행률: `[███████████████░░░░░] 75.0%` (한 칸 5%p).
 - 로컬 재현 및 테스트 통과만으로 완료 처리하지 않는다. 변경 코드에 대한 실제 GitHub Actions 성공 근거가 필요하다.
 - 미검증, 진행 중, 보류 작업은 완료 가중치에 포함하지 않는다.
 - 이 기록을 새 세션에서 읽을 때 실제 Commit, PR, Actions 상태를 대조한다. 완료 작업을 중복 계산하거나 진행률을 임의로 초기화하지 않는다.
@@ -36,7 +36,7 @@
 | S-04 | 비정상 숫자 파싱 오류 격리 | High | 15% | 보류 | 별도 처리 방침 승인 필요 |
 | S-05 | SSH 진단 응답 한도와 연결 자원 정리 | Medium | 10% | 완료 | Actions 39806415444 전체 성공, 381개 테스트 OK(기존 WAL 하위 사례 4개 skip), EXE 검증 통과 |
 | S-06 | UI 이력 응답 역전 및 일시 조회 실패 복구 | Medium | 10% | 완료 | Actions 39810972763 전체 성공, Node UI15개/기존 설정/Python381개/EXE 검증 통과 |
-| S-07 | Excel 제목/부제의 제어 문자 방어 | Medium | 5% | 진행 중 | 신규6개/기존16개 로컬 PASS, 변경 코드 Actions 미실행 |
+| S-07 | Excel 제목/부제의 제어 문자 방어 | Medium | 5% | 완료 | Actions 39814068606 전체 성공, 신규 Excel6개/Python387개/EXE 검증 통과 |
 | S-08 | 비정상 보고서 ID/토큰 예외 처리 | Low | 5% | 대기 | 미실행 |
 | S-09 | 최종 기능 보존 및 Windows 실행 검증 | Low | 5% | 대기 | 미실행 |
 
@@ -162,7 +162,7 @@
 
 ## 기능 보존 체크리스트
 
-| 기존 기능 | 누적 확인 방법 | S-06 코드 Actions 누적 확인 상태 |
+| 기존 기능 | 누적 확인 방법 | S-07 코드 Actions 누적 확인 상태 |
 |---|---|---|
 | BB/MM/WLC 명령과 결과 | 명령/collector/evaluate 변경 없음, 기존 전체 CI | CI Mock/Fixture 검증 통과 |
 | CPU/메모리 및 임계값 | parser/evaluate 변경 없음, Fixture 테스트 | CI 통과 |
@@ -180,7 +180,7 @@
 
 S-02의 기능 보존 확인: 정상 직렬 순서/병렬 상한/실제 시작 시점의 제한 시간, MM 명령과 CPU·메모리/정상 판정, 기존 클러스터 fallback, 기준값·이력 원자 저장, 과거 보고서와 VRRP, 스케줄러 반복/폐기 후 재실행 회귀가 로컬 및 Windows Actions에서 통과했다. `commands.py`, `collector.py`, `parsers.py`, `evaluate.py`, Store/DB 스키마, 자격 증명 저장 코드, UI/API/보고서 모듈, workflow/패키지는 S-01 완료 코드에서 바꾸지 않았다. 해당 단계의 검증 근거는 [S-02 코드 Actions 39793991393](https://github.com/yejin0414/auto_network/actions/runs/39793991393)다.
 
-현재 위 표는 [S-06 코드 Actions 39810972763](https://github.com/yejin0414/auto_network/actions/runs/39810972763)의 전체 테스트 및 Windows EXE 누적 검증 결과로 갱신했다. S-06은 화면 구성/HTML/CSS/API를 유지하면서 JS 응답 적용과 최신 재시도만 보강했고 실제 함수 회귀15개와 기존 설정 검증이 통과했다. S-05의 정상 진단 단계/명령/결과 보존은 신규 Mock 회귀와 실제 SDK/가짜 SSH 서버 통합에서 통과했다. S-03은 Store 읽기와 Excel 호출부만 보강했고, 명령·판정·DB 스키마·UI·보고서 생성 형식·workflow·패키지는 보존했다. Windows SQLite 3.49.1의 기존 정책에 따라 WAL 하위 사례 4개는 skip이며 실제 사용 모드 DELETE 검증은 통과했다. WAL 경합은 로컬 SQLite 3.53.1에서 통과한 별도 근거로 구분한다. 실제 운영 장비·장시간 사용·모바일 기기·토스트 수동 확인은 계속 미검증이다.
+현재 위 표는 [S-07 코드 Actions 39814068606](https://github.com/yejin0414/auto_network/actions/runs/39814068606)의 전체 테스트 및 Windows EXE 누적 검증 결과로 갱신했다. S-07은 Excel 제목/부제의 금지 문자 제거 두 줄만 보강했고, 기존 길이/서식/수식 문자열/저장 context와 DB 불변을 신규6개에서 검증했다. S-06은 화면 구성/HTML/CSS/API를 유지하면서 JS 응답 적용과 최신 재시도만 보강했고 실제 함수 회귀15개와 기존 설정 검증이 통과했다. S-05의 정상 진단 단계/명령/결과 보존은 신규 Mock 회귀와 실제 SDK/가짜 SSH 서버 통합에서 통과했다. S-03은 Store 읽기와 Excel 호출부만 보강했고, 명령·판정·DB 스키마·UI·보고서 생성 형식·workflow·패키지는 보존했다. Windows SQLite 3.49.1의 기존 정책에 따라 WAL 하위 사례 4개는 skip이며 실제 사용 모드 DELETE 검증은 통과했다. WAL 경합은 로컬 SQLite 3.53.1에서 통과한 별도 근거로 구분한다. 실제 운영 장비·장시간 사용·모바일 기기·토스트 수동 확인은 계속 미검증이다.
 
 ## S-01 실행 기록
 
@@ -262,9 +262,9 @@ python -m unittest tests.test_engine_timeouts tests.test_timeouts tests.test_clu
 
 - S-01의 수정/검증은 완료했다. PR #8은 검토용 Draft이며 병합/릴리스/배포는 수행하지 않았다.
 - S-02의 수정 및 Windows Actions 검증을 완료했다. 종료에 응답하지 않는 실제 일반 worker/helper는 강제 제거하지 않고 슬롯을 계속 점유한다. 이 경우 후속 미시도 장비는 기존 '확인 불가'로 기록하며, 실행 슬롯이 실제 해제되면 다음 점검에서 복구한다. 기존 클러스터 fallback은 변경하지 않았다.
-- S-03의 이력/보고서 읽기 일관성 수정과 Windows Actions 검증을 완료했다. Excel용 단일 회차의 압축 원문은 보고서 처리 동안 메모리에 유지되며, 일반 조회에는 추가하지 않는다. S-05의 진단 수신 한도/자원 정리와 S-06의 UI 응답 경합도 Windows Actions 검증을 완료했다. S-07은 수정·검증 중이며 S-08의 재현된 입력 오류는 아직 수정하지 않았다.
+- S-03의 이력/보고서 읽기 일관성 수정과 Windows Actions 검증을 완료했다. Excel용 단일 회차의 압축 원문은 보고서 처리 동안 메모리에 유지되며, 일반 조회에는 추가하지 않는다. S-05의 진단 수신 한도/자원 정리와 S-06의 UI 응답 경합도 Windows Actions 검증을 완료했다. S-07의 Excel 제목/부제 문자 방어도 Windows Actions 검증을 완료했다. S-08의 재현된 입력 오류는 아직 수정하지 않았다.
 - S-04는 잘못된 수치를 어떤 상태로 표시할지 별도 승인 전까지 수정하지 않는다.
-- 현재 승인 작업은 S-07(가중치 5%, Medium), Excel 제목/부제의 제어 문자 방어다. 검증 성공 후 S-08로 진행한다. S-04 보류를 유지하며 한 번에 하나씩 진행한다. 각 작업 전 실제 기준과 중복 변경 여부를 확인하고 Commit/PR/검증 근거를 이 문서에 이어 기록한다.
+- 다음 승인 작업은 S-08(가중치 5%, Low), 비정상 보고서 ID/토큰 예외 처리다. S-04 보류를 유지하며 한 번에 하나씩 진행한다. 각 작업 전 실제 기준과 중복 변경 여부를 확인하고 Commit/PR/검증 근거를 이 문서에 이어 기록한다.
 
 ## S-03 실행 기록
 
@@ -414,3 +414,16 @@ python -m unittest tests.test_diagnose_limits tests.test_diagnose_resources test
 - 기존 ExcelDataIntegrity, ReportSnapshotExports, ReportSettingsCapture, ExcelReport, ClusterSourceReports: **16개, 10.684초, OK**. 직접 생성·다운로드·저장/열기·자동 저장, 과거 문맥·상태, 점검 중 설정 변경, 클러스터 출처와 기존 Excel/HTML 결과를 검증했다.
 - 제품 diff는 `nc/excel.py` 두 줄뿐이다. 신규 테스트와 이 문서를 포함한 세 경로만 Commit에 포함한다. 기존 workflow의 unittest discover가 새 파일을 실행하므로 workflow/패키지는 변경하지 않는다.
 - 변경 코드 GitHub Actions는 아직 미실행이다. 로컬 PASS만으로 완료 처리하지 않으며 진행률은 **70.0%**를 유지한다.
+
+
+### S-07 GitHub Actions 검증 및 완료 판정
+
+1. 코드 Commit [`b114b28d14b3eb343932376c6037ed87eae77990`](https://github.com/yejin0414/auto_network/commit/b114b28d14b3eb343932376c6037ed87eae77990), Tree `8b8725dbaf24bb7fb7cab1eb8ec9658c57d8091c`를 기존 Draft PR #8에 추가했다. 원격 121개 파일 중 예정한 세 경로만 변경됐고 로컬 blob SHA와 일치했다. 삭제는 없다.
+2. [Actions 39814068606](https://github.com/yejin0414/auto_network/actions/runs/39814068606)의 head_sha가 위 코드와 일치하며 최종 **completed/success**다. 시작2026-10-22 16:26:19 UTC, 최종 상태 갱신16:44:46 UTC다. [Job119947769225](https://github.com/yejin0414/auto_network/actions/runs/39814068606/job/119947769225)도 completed/success이며22개 단계가 모두 성공이다. 중간 조회에서 일부 단계/상위 상태 반영이 늦었으므로 실제 로그와 최종 Run/Job 상태를 모두 대조한 뒤 완료 처리했다.
+3. 실제 로그: **Ran 387 tests in 209.586s, OK (skipped=4)**. 신규 Excel6개 각각 ok, Node history UI15개 및 기존 설정 UI PASS, 소스121개 파일 검증 PASS다. skip4는 기존 Windows SQLite3.49.1 정책의 미지원 WAL 하위 사례이며 실제 DELETE 검증은 통과했다.
+4. 합성1GiB DB의29개 단계, EXE 빌드·Demo·계정 저장/보상 복구/MockSSH·재시작·중복 실행/포트 독점·창/종료/Excel 저장과 내려받기·Windows 예약 작업·artifact/로그 보관 모두 성공이다. 실제 화면 toast는 NOT_RUN, 실장비·장시간 운영/절전 복귀·물리 모바일 기기는 미검증이다.
+5. 독립 제품/테스트 검토에서도 차단 결함이나 정상 동작 변경을 발견하지 못했다. 정상 허용 문자·장문·literal 타입·시트/서식/판정과 원본 설정/이력/DB 보존을 로컬 및 Windows에서 확인했다.
+
+**S-07 완료 판정:** 실제 변경 Commit의 전체 Actions 성공으로5%를 반영한다. 완료6개, **75.0%**, 이전 대비 **+5.0%p**, 잔여3개/25%다. S-04 보류를 유지하며 다음 승인 작업S-08로 계속한다. 작업/가중치 변경은 없다.
+
+후속 완료 기록 Commit은 이 문서만 변경한다. 제품 blob `7d9e3e648d2c0b3d28e44d979ec2ed36df2970ac`, 신규 회귀 blob `fd8a887b2e089965595ecb9439ce116696c36f7f`는 검증 코드와 동일하게 유지한다. 추가 문서 CI는 별도로 확인하며 미실행/진행 중 상태를 성공으로 간주하지 않는다.
