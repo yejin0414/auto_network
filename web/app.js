@@ -43,7 +43,11 @@
     const r = await fetch(path, opt);
     let data = null;
     try { data = await r.json(); } catch { data = null; }
-    if (!r.ok) throw new Error((data && data.error) || `요청 실패 (${r.status})`);
+    if (!r.ok) {
+      const error = new Error((data && data.error) || `요청 실패 (${r.status})`);
+      error.rollbackFailed = data?.rollback_failed === true;
+      throw error;
+    }
     return data;
   }
 
@@ -97,12 +101,13 @@
   });
 
   // ------------------------------------------------------------------ 데이터 갱신
-  async function refreshState() {
+  async function refreshState(strict = false) {
     try {
       S.st = await api("/api/state");
       S.clockOffset = S.st.engine.now - Date.now() / 1000;
     } catch (e) {
       $("#schedText").textContent = "프로그램과 연결이 끊겼습니다";
+      if (strict) throw e;
       return;
     }
     const newest = S.st.latest_run_id;
@@ -616,14 +621,15 @@
     const credCard = Object.entries(st.credential_profiles).map(([p, label]) => {
       const c = creds[p];
       return `<form class="cred" data-profile="${p}">
-        <div class="cred-head"><b>${esc(label)}</b><span class="badge ${c ? "ok" : "unknown"}">${c ? `입력됨: ${esc(c.username)}${c.remembered ? " (PC에 저장)" : ""}` : "미입력"}</span></div>
+        <div class="cred-head"><b>${esc(label)}</b><span class="badge ${c ? "ok" : "unknown"}">${c ? `입력됨: ${esc(c.username)}${c.storage_uncertain ? " (PC 저장 확인 필요)" : c.remembered ? " (PC에 저장)" : ""}` : "미입력"}</span></div>
         <div class="form-row">
           <div class="field"><label>아이디</label><input class="input" name="username" autocomplete="username" value="${esc(c?.username || "")}"></div>
           <div class="field"><label>비밀번호</label><input class="input" name="password" type="password" autocomplete="current-password" placeholder="${c ? "변경할 때만 입력" : ""}"></div>
         </div>
         <label class="check"><input type="checkbox" name="remember" ${c?.remembered || (!c && st.keyring) ? "checked" : ""} ${st.keyring ? "" : "disabled"}> Windows 자격 증명 관리자에 저장 (재시작 후에도 자동 점검 유지)</label>
-        ${st.keyring ? "" : `<p class="note">이 PC에는 keyring 패키지가 없어 프로그램이 켜져 있는 동안만 기억합니다.</p>`}
-        <div class="actions" style="margin-top:0">${c ? `<button type="button" class="btn ghost small danger" data-clear>계정 지우기</button>` : ""}<button class="btn small primary">계정 저장</button></div>
+        ${st.keyring ? "" : `<p class="note">이 PC에서는 자격 증명 관리자를 사용할 수 없어 프로그램이 켜져 있는 동안만 기억합니다.</p>`}
+        ${st.credential_storage_uncertain ? `<p class="err">PC에 저장된 계정 상태를 확인할 수 없습니다. 계정 지우기를 완료한 뒤 다시 저장하세요.</p>` : ""}
+        <div class="actions" style="margin-top:0"><button type="button" class="btn ghost small danger" data-clear ${c || st.credential_storage_uncertain ? "" : "hidden"}>계정 지우기</button><button class="btn small primary">계정·설정 저장</button></div>
       </form>`;
     }).join("");
 
@@ -705,14 +711,26 @@
 
     $$(".cred", el).forEach((f) => f.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const r = await saveCredentials();
-      if (r.error) { toast(r.error); return; }
-      if (!r.saved.length) { toast("아이디와 비밀번호를 입력한 뒤 저장하세요."); return; }
-      await afterCredentialsSaved(r);
+      await saveSettings();
     }));
     $$(".cred [data-clear]", el).forEach((b) => b.addEventListener("click", async () => {
-      const p = b.closest(".cred").dataset.profile;
-      try { await api("/api/credentials", { profile: p, clear: true }); toast("계정을 지웠습니다."); await refreshState(); renderSettings(); } catch (err) { toast(err.message); }
+      if (S.savingSettings) return;
+      const f = b.closest(".cred"), p = f.dataset.profile;
+      S.savingSettings = true; b.disabled = true;
+      try {
+        const result = await api("/api/credentials", { profile: p, clear: true });
+        S.st.credentials = result.credentials; S.st.credential_storage_uncertain = false;
+      } catch (err) {
+        toast(err.message); if (err.rollbackFailed) showCredentialStorageUncertain();
+        S.savingSettings = false; b.disabled = false; return;
+      }
+      // Keep unrelated unsaved settings in the form after clearing the account.
+      $("[name=username]", f).value = ""; $("[name=password]", f).value = "";
+      const badge = $(".badge", f); badge.textContent = "미입력"; badge.className = "badge unknown";
+      $(".err", f)?.remove(); b.hidden = true; b.disabled = false;
+      try { await refreshState(true); toast("계정을 지웠습니다. 다른 설정의 입력은 유지했습니다."); }
+      catch { toast("계정은 지웠습니다. 상태를 확인하려면 화면을 새로고침하세요."); }
+      S.savingSettings = false;
     }));
     $("#devBody").addEventListener("input", () => { S.devDirty = true; });
     $("#devBody").addEventListener("change", () => { S.devDirty = true; });
@@ -847,31 +865,30 @@
     });
   }
 
-  // 입력된 계정을 모두 저장합니다(어느 저장 버튼을 눌러도 같은 동작).
-  async function saveCredentials() {
-    const saved = [], notes = [];
+  // Collect all changes first; one server request validates and commits them.
+  function readCredentialChanges() {
+    const saved = [], changes = [];
+    let check = false;
     for (const f of $$("#tab-settings .cred")) {
       const fd = new FormData(f);
       const username = String(fd.get("username") || "").trim();
       const password = String(fd.get("password") || "");
+      const remember = !!fd.get("remember");
       const label = S.st.credential_profiles[f.dataset.profile];
       const already = (S.st.credentials || {})[f.dataset.profile];
-      if (!password) {
-        if (username && !already) return { error: `${label}의 비밀번호를 입력하세요.`, saved, notes };
-        continue;
-      }
-      if (!username) return { error: `${label}의 아이디를 입력하세요.`, saved, notes };
-      try {
-        const r = await api("/api/credentials", { profile: f.dataset.profile, username, password, remember: !!fd.get("remember") });
-        saved.push(label);
-        if (r.note) notes.push(r.note);
-      } catch (e) { return { error: `${label} 저장 실패: ${e.message}`, saved, notes }; }
+      if (!username && !password && !already) continue;
+      if (!username) return { error: `${label}의 아이디를 입력하세요.` };
+      if (!password && (!already || username !== already.username)) return { error: `${label}의 새 비밀번호를 입력하세요.` };
+      if (!password && remember === !!already?.remembered && !S.st.credential_storage_uncertain) continue;
+      changes.push({ profile: f.dataset.profile, username, password, remember });
+      saved.push(label); check ||= !!password;
     }
-    return { saved, notes };
+    return { saved, changes, check, notes: [] };
   }
 
   async function afterCredentialsSaved(r) {
-    await refreshState(); renderSettings();
+    try { await refreshState(true); renderSettings(); }
+    catch { toast("계정과 설정은 저장했습니다. 상태를 확인하려면 화면을 새로고침하세요."); return; }
     const miss = missingProfiles();
     const head = `${r.saved.join(", ")}을 저장했습니다.` + (r.notes.length ? ` ${r.notes.join(" ")}` : "");
     if (miss.length) { toast(`${head} ${miss.map((p) => S.st.credential_profiles[p]).join(", ")}도 입력하세요.`); return; }
@@ -901,7 +918,18 @@
     else $("#saveErr").scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
+  function showCredentialStorageUncertain() {
+    S.st.credential_storage_uncertain = true;
+    $$("#tab-settings .cred").forEach((form) => {
+      $("[data-clear]", form).hidden = false;
+      let warning = $(".err", form);
+      if (!warning) { warning = document.createElement("p"); warning.className = "err"; form.append(warning); }
+      warning.textContent = "PC에 저장된 계정 상태를 확인할 수 없습니다. 계정 지우기를 완료한 뒤 다시 저장하세요.";
+    });
+  }
+
   async function saveSettings() {
+    if (S.savingSettings) return;
     const cfg = JSON.parse(JSON.stringify(S.st.config));
     const rows = readDevRows();
     const half = rows.find((d) => (d.name && !d.host));
@@ -917,18 +945,32 @@
     cfg.report = { excel_auto: $("#rExcel").checked, notify: $("#rNotify").checked, folder: $("#rFolder").value.trim() };
     cfg.site_name = $("#sSite").value.trim() || "무선망 통합 점검";
     cfg.retention_days = Number($("#sRetention").value || 30);
-    const cr = await saveCredentials();
+    const cr = readCredentialChanges();
     if (cr.error) { showSaveError(cr.error); return; }
+    S.savingSettings = true;
+    const buttons = $$("#tab-settings .cred button, #saveCfg");
+    buttons.forEach((button) => { button.disabled = true; });
+    let res;
     try {
-      const res = await api("/api/config", cfg);
-      $("#saveErr").textContent = "";
-      S.devDirty = false;
-      const ds = res.config.devices, cnt = (r) => ds.filter((d) => d.role === r).length;
-      const summary = `장비 ${ds.length}대(백본 ${cnt("BB")} · MM ${cnt("MM")} · WLC ${cnt("WLC")})를 저장했습니다.`;
-      if (cr.saved.length) { await afterCredentialsSaved(cr); renderAll(); toast(summary + " 바로 점검을 시작합니다."); return; }
-      toast(summary + " 다음 점검부터 적용됩니다.");
-      await refreshState(); renderAll(); renderSettings();
-    } catch (e) { showSaveError(e.message); }
+      res = await api("/api/settings", { config: cfg, credentials: cr.changes });
+    } catch (e) {
+      showSaveError(e.message);
+      if (e.rollbackFailed) showCredentialStorageUncertain();
+      S.savingSettings = false; buttons.forEach((button) => { button.disabled = false; });
+      return;
+    }
+    $("#saveErr").textContent = "";
+    S.devDirty = false;
+    const ds = res.config.devices, cnt = (r) => ds.filter((d) => d.role === r).length;
+    const summary = `장비 ${ds.length}대(백본 ${cnt("BB")} · MM ${cnt("MM")} · WLC ${cnt("WLC")})와 설정을 저장했습니다.`;
+    try {
+      if (cr.check) { await afterCredentialsSaved(cr); renderAll(); }
+      else { await refreshState(true); renderAll(); renderSettings(); toast(summary + " 다음 점검부터 적용됩니다."); }
+    } catch {
+      toast("계정과 설정은 저장했습니다. 상태를 확인하려면 화면을 새로고침하세요.");
+    } finally {
+      S.savingSettings = false; buttons.forEach((button) => { button.disabled = false; });
+    }
   }
 
   // ------------------------------------------------------------------ 상세 서랍

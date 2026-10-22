@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -52,6 +53,51 @@ def check(token):
     return json.loads(req("/api/run", token=token))
 
 
+def rejected_settings(token, body, status):
+    try:
+        req("/api/settings", body, token)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == status, f"예상한 저장 오류 {status}, 실제 {exc.code}"
+        payload = json.loads(exc.read().decode("utf-8"))
+        assert payload.get("error"), "실패 응답에 오류 설명 없음"
+        assert body["credentials"][0]["password"] not in json.dumps(payload), "오류 응답에 비밀번호 포함"
+    else:
+        raise AssertionError("실패해야 할 설정·계정 저장이 성공함")
+
+
+def verify_failed_combined_save(token, config_path):
+    """Exercise validation and native keyring rollback inside the disposable runner."""
+    before = json.loads(req("/api/state", token=token))
+    disk = config_path.read_bytes()
+    changed = json.loads(json.dumps(before["config"]))
+    changed["site_name"] = "Uncommitted synthetic site"
+    credential = {"profile": "shared", "username": "uncommitted", "password": "WRONG-SYNTHETIC",
+                  "remember": True}
+    invalid = json.loads(json.dumps(changed))
+    invalid["thresholds"].update(cpu_warn=95, cpu_crit=50)
+    rejected_settings(token, {"config": invalid, "credentials": [credential]}, 400)
+    state = json.loads(req("/api/state", token=token))
+    assert state["config"] == before["config"], "설정 검증 실패 후 설정 변경됨"
+    assert state["credentials"] == before["credentials"], "설정 검증 실패 후 계정 변경됨"
+    assert config_path.read_bytes() == disk, "설정 검증 실패 후 디스크 내용 변경됨"
+
+    # Stage a valid config, but prevent its final atomic file replacement. This
+    # exercises compensation after a native Windows credential write succeeds.
+    backup = config_path.with_name("transaction-check-backup.json")
+    config_path.replace(backup)
+    config_path.mkdir()
+    try:
+        rejected_settings(token, {"config": changed, "credentials": [credential]}, 500)
+        state = json.loads(req("/api/state", token=token))
+        assert state["config"] == before["config"], "설정 쓰기 실패 후 메모리 설정 변경됨"
+        assert state["credentials"] == before["credentials"], "설정 쓰기 실패 후 계정 변경됨"
+    finally:
+        config_path.rmdir()
+        backup.replace(config_path)
+    assert config_path.read_bytes() == disk
+    print("설정 검증/파일 교체 실패 시 설정·계정 보존 확인")
+
+
 def main():
     bb = MockDevice("<BB-3>", comware({}), legacy=True)  # 오래된 Comware처럼 SHA-1 SSH만 제공
     wlc = MockDevice("(WLC-01) #", aruba("wlc"))
@@ -68,9 +114,19 @@ def main():
 
     p, tok = start()
     try:
-        req("/api/credentials", {"profile": "shared", "username": "op", "password": "pw", "remember": True}, tok)
+        cfg = json.loads(req("/api/state", token=tok))["config"]
+        cfg["site_name"] = "Synthetic combined save"
+        req("/api/settings", {"config": cfg, "credentials": [
+            {"profile": "shared", "username": "op", "password": "pw", "remember": True}]}, tok)
         state = json.loads(req("/api/state", token=tok))
         print("계정 상태:", state["credentials"], "keyring:", state["keyring"])
+        assert state["config"]["site_name"] == cfg["site_name"]
+        assert state["credentials"]["shared"]["remembered"] is True
+        # Older clients can still update the shared credential separately;
+        # an empty password for the same user must retain the current secret.
+        req("/api/credentials", {"profile": "shared", "username": "op", "password": "",
+                                 "remember": True}, tok)
+        verify_failed_combined_save(tok, cfg_dir / "config.json")
         run = check(tok)
         for d, v in run["devices"].items():
             print(d, v["connected"], v["status"], v.get("error"))
@@ -85,8 +141,11 @@ def main():
         state = json.loads(req("/api/state", token=tok))
         print("재시작 후 계정 상태:", state["credentials"])
         assert set(state["credentials"]) == {"shared"}, "재시작 후 계정이 유지되지 않았습니다"
+        assert state["credentials"]["shared"]["username"] == "op", "복구된 계정이 재시작 후 유지되지 않음"
+        assert state["config"]["site_name"] == "Synthetic combined save", "실패한 설정이 재시작 후 반영됨"
         run = check(tok)
         assert all(v["connected"] for v in run["devices"].values()), "재시작 후 SSH 접속 실패"
+        print("설정 저장 실패 후 재시작: 기존 Windows 저장 계정으로 Mock SSH 점검 성공")
         req("/api/credentials", {"profile": "shared", "clear": True}, tok)
     finally:
         p.kill(); p.wait()

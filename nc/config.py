@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import re
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,16 @@ def normalize_device(raw: dict[str, Any], index: int) -> dict[str, Any]:
 def validate(cfg: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ConfigError("설정은 JSON 객체여야 합니다.")
+    def reject_secrets(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in {"password", "secret", "credentials", "api_token", "access_token", "token"}:
+                    raise ConfigError("계정과 비밀번호·토큰은 설정 파일에 포함할 수 없습니다. 접속 계정 항목을 사용하세요.")
+                reject_secrets(item)
+        elif isinstance(value, list):
+            for item in value:
+                reject_secrets(item)
+    reject_secrets(cfg)
     for key in ("schedule", "thresholds", "ssh", "extra_commands", "report", "server"):
         if key in cfg and not isinstance(cfg[key], dict):
             raise ConfigError(f"{key} 설정은 JSON 객체여야 합니다.")
@@ -216,9 +227,22 @@ class ConfigStore:
 
     def save(self, new_cfg: dict[str, Any]) -> dict[str, Any]:
         cfg = validate(new_cfg)
+        text = json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False)
+        result = copy.deepcopy(cfg)
         with self._lock:
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self.path)
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                                 prefix=self.path.name + ".", suffix=".tmp", delete=False) as file:
+                    tmp = Path(file.name)
+                    file.write(text)
+                tmp.replace(self.path)
+                tmp = None  # The commit succeeded; cleanup cannot undo it.
+            finally:
+                if tmp is not None:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass  # Retain the original write/replace error.
             self._cfg = cfg
-        return copy.deepcopy(cfg)
+        return result

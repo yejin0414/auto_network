@@ -56,6 +56,35 @@ def _failed(key: str, label: str, r: CmdResult) -> dict[str, Any]:
     return check(key, label, "unknown", r.error or "출력을 해석하지 못했습니다.", [r.output[:300]] if r.output else [], r)
 
 
+def _optional_failed(key: str, label: str, r: CmdResult, base: dict) -> dict[str, Any]:
+    """Incomplete output cannot imply disappearance or update a baseline.
+
+    Retain only unambiguous failures read from individual valid rows, while
+    showing that the rest of this command still could not be interpreted.
+    """
+    rows = P.optional_partial_rows(r.output, key) if r.ok else []
+    bad, warnings = [], []
+    for row in rows:
+        state = row.get("state", "").lower()
+        if key == "device":
+            failed = state in ("fault", "faulty", "abnormal", "offline") or (state == "absent" and row["slot"] in base.get("slots", []))
+        elif key in ("power", "fan"):
+            previous = base.get(f"{key}_states", {}).get(f"{row['slot']}/{row['id']}", "").lower()
+            failed = state in P.BAD_HW or (state == "absent" and previous == "normal")
+        elif key == "ospf":
+            failed = not state.startswith(("full", "2-way"))
+        else:
+            failed = row["selected"] < base.get("lagg", {}).get(row["group"], 0)
+            if row["unselected"] > 0:
+                warnings.append(row["line"])
+        if failed:
+            bad.append(row["line"])
+    if bad or warnings:
+        return check(key, label, "crit" if bad else "warn", "확인된 이상 있음 · 출력 일부 해석 불가",
+                     bad + warnings + [r.output[:300]], r)
+    return _failed(key, label, r)
+
+
 # ------------------------------------------------------------------ 공통 지표
 
 def eval_common(dc: DeviceCollection, role: str, th: dict, prev: dict | None, metrics: dict, checks: list, now: float) -> None:
@@ -128,8 +157,8 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
 
     r = dc.results.get("device")
     if r:
-        slots = P.parse_device_slots(r.output) if r.ok else []
-        if slots:
+        slots = P.parse_device_slots_snapshot(r.output) if r.ok else None
+        if slots is not None:
             bad = [s for s in slots if s["state"].lower() in ("fault", "faulty", "abnormal", "offline")]
             now_ids = {s["slot"] for s in slots if s["state"].lower() not in ("absent",)}
             missing = sorted(set(base.get("slots", [])) - now_ids)
@@ -137,22 +166,24 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
                 checks.append(check("device", "슬롯/IRF", "crit", f"비정상 슬롯 {len(bad)}개", [s["line"] for s in bad], r))
             elif missing:
                 checks.append(check("device", "슬롯/IRF", "crit", f"기준 대비 사라진 슬롯: {', '.join(missing)}", [], r))
-            else:
+            elif now_ids:
                 roles = ", ".join(f"{s['slot']}:{s['state']}" for s in slots)
-                checks.append(check("device", "슬롯/IRF", "ok", f"{len(slots)}개 정상 ({roles})", [], r))
-            if "slots" not in base:
+                checks.append(check("device", "슬롯/IRF", "ok", f"장착 {len(now_ids)}개 ({roles})", [], r))
+            else:
+                checks.append(check("device", "슬롯/IRF", "unknown", "동작 중인 슬롯을 확인하지 못했습니다.",
+                                    [s["line"] for s in slots], r))
+            if "slots" not in base and now_ids and not bad:
                 nb["slots"] = sorted(now_ids)
-        elif not r.ok:
-            checks.append(_failed("device", "슬롯/IRF", r))
+        else:
+            checks.append(_optional_failed("device", "슬롯/IRF", r, base))
 
-    for key, label, parser in (("power", "전원", P.parse_power), ("fan", "팬", P.parse_fan)):
+    for key, label, parser in (("power", "전원", P.parse_power_snapshot), ("fan", "팬", P.parse_fan_snapshot)):
         r = dc.results.get(key)
         if not r:
             continue
-        items = parser(r.output) if r.ok else []
-        if not items:
-            if not r.ok:
-                checks.append(_failed(key, label, r))
+        items = parser(r.output) if r.ok else None
+        if items is None:
+            checks.append(_optional_failed(key, label, r, base))
             continue
         bkey = f"{key}_states"
         prev = base.get(bkey, {})
@@ -160,16 +191,24 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
         bad = [i for i in items if i["state"].lower() in P.BAD_HW]
         lost = [i for i in items if i["state"].lower() == "absent" and prev.get(f"{i['slot']}/{i['id']}", "").lower() == "normal"]
         unclassified = [i for i in items if i["state"].lower() not in (*P.BAD_HW, "normal", "absent")]
+        missing = ([] if unclassified else [identifier for identifier, state in prev.items()
+                                             if state.lower() == "normal" and identifier not in cur])
         normal = sum(1 for i in items if i["state"].lower() == "normal")
-        if bad or lost:
-            checks.append(check(key, label, "crit", f"이상 {len(bad) + len(lost)}개 / 전체 {len(items)}개", [i["line"] for i in bad + lost], r))
+        if bad or lost or missing:
+            summary = f"이상 {len(bad) + len(lost) + len(missing)}개 / 현재 {len(items)}개"
+            if unclassified:
+                summary += " · 출력 일부 해석 불가"
+            checks.append(check(key, label, "crit", summary, [i["line"] for i in bad + lost + unclassified] +
+                                [f"{identifier}: 기준 항목 사라짐" for identifier in missing], r))
         elif unclassified:
             checks.append(check(key, label, "unknown", f"정상 여부를 확인할 상태 {len(unclassified)}개",
                                 [i["line"] for i in unclassified], r))
-        else:
+        elif items:
             absent = len(items) - normal
             checks.append(check(key, label, "ok", f"Normal {normal}개" + (f" · 미장착 {absent}개" if absent else ""), [], r))
-        if bkey not in base:
+        else:
+            checks.append(check(key, label, "info", "명시적으로 보고된 항목 없음", [], r))
+        if bkey not in base and normal and not bad and not unclassified:
             nb[bkey] = cur
 
     r = dc.results.get("interface")
@@ -201,8 +240,8 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
 
     r = dc.results.get("lagg")
     if r:
-        groups = P.parse_lagg(r.output) if r.ok else {}
-        if groups:
+        groups = P.parse_lagg_snapshot(r.output) if r.ok else None
+        if groups is not None:
             prev = base.get("lagg", {})
             dec = [f"{g}: Selected {prev[g]} → {v['selected']}" for g, v in groups.items() if g in prev and v["selected"] < prev[g]]
             gone = [f"{g}: 집계 그룹 사라짐" for g in prev if g not in groups]
@@ -211,19 +250,22 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
                 checks.append(check("lagg", "LACP", "crit", "Selected 포트 감소", dec + gone, r))
             elif unsel:
                 checks.append(check("lagg", "LACP", "warn", f"Unselected 포트 있음 ({len(unsel)}개 그룹)", unsel, r))
-            else:
+            elif groups:
                 checks.append(check("lagg", "LACP", "ok", f"{len(groups)}개 그룹 모두 Selected", [], r))
+            else:
+                checks.append(check("lagg", "LACP", "info", "명시적으로 보고된 집계 그룹 없음", [], r))
             merged = dict(prev)
             for g, v in groups.items():
                 merged[g] = max(prev.get(g, 0), v["selected"])
-            nb["lagg"] = merged
-        elif not r.ok:
-            checks.append(_failed("lagg", "LACP", r))
+            if merged:
+                nb["lagg"] = merged
+        else:
+            checks.append(_optional_failed("lagg", "LACP", r, base))
 
     r = dc.results.get("ospf")
     if r:
-        peers = P.parse_ospf(r.output) if r.ok else []
-        if peers or (r.ok and "ospf" in base):
+        peers = P.parse_ospf_snapshot(r.output) if r.ok else None
+        if peers is not None:
             bad = [p for p in peers if not p["state"].lower().startswith(("full", "2-way"))]
             now_ids = {p["router_id"] for p in peers}
             missing = sorted(set(base.get("ospf", [])) - now_ids)
@@ -231,11 +273,14 @@ def eval_backbone(dc: DeviceCollection, base: dict, checks: list, metrics: dict)
                 ev = [f"{p['router_id']} ({p['interface']}) {p['state']}" for p in bad] + [f"{m}: 인접 사라짐" for m in missing]
                 parts = ([f"Full 아님 {len(bad)}개"] if bad else []) + ([f"인접 사라짐 {len(missing)}개"] if missing else [])
                 checks.append(check("ospf", "OSPF", "crit", " · ".join(parts), ev, r))
-            else:
+            elif peers:
                 checks.append(check("ospf", "OSPF", "ok", f"인접 {len(peers)}개 모두 Full", [], r))
-            nb["ospf"] = sorted(set(base.get("ospf", [])) | now_ids)
-        elif not r.ok:
-            checks.append(_failed("ospf", "OSPF", r))
+            else:
+                checks.append(check("ospf", "OSPF", "info", "명시적으로 보고된 OSPF 인접 없음", [], r))
+            if now_ids:
+                nb["ospf"] = sorted(set(base.get("ospf", [])) | now_ids)
+        else:
+            checks.append(_optional_failed("ospf", "OSPF", r, base))
 
     r = dc.results.get("vrrp")
     if r:

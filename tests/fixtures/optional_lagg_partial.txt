@@ -1,0 +1,7 @@
+Aggregation Interface Type:
+BAGG -- Bridge-Aggregation, RAGG -- Route-Aggregation
+AGG        AGG   Partner ID              Selected  Unselected  Individual  Share
+Interface  Mode                          Ports     Ports       Ports       Type
+--------------------------------------------------------------------------------
+BAGG10     D     0x8000, 0200-0000-0010  2         0           0           Shar
+BAGG20     D     0x8000, 0200-0000-0020

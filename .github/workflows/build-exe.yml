@@ -26,6 +26,13 @@ jobs:
       - name: 공개 소스 스냅샷 점검
         run: python tools/check_snapshot.py
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 설정 UI 저장 흐름 검증
+        run: node tests/test_settings_ui.cjs
+
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
