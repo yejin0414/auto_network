@@ -105,6 +105,8 @@ class App:
             return 200, self.state()
         if path == "/api/run":
             rid = int(q["id"]) if q.get("id") else None
+            if rid is not None and not -(2 ** 63) <= rid < 2 ** 63:
+                raise ValueError("Python int too large to convert to SQLite INTEGER")
             run = st.get_run(rid)
             return (200, run) if run else (404, {"error": "점검 기록이 없습니다."})
         if path == "/api/runs":

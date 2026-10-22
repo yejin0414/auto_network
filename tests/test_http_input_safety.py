@@ -1,7 +1,7 @@
 """HTTP input boundaries preserve existing responses and accepted input forms.
 
 Real Handler methods run without sockets or a server. Storage is mocked except
-for one temporary SQLite fixture; window callbacks and timers are mocked. The
+for temporary SQLite fixtures; window callbacks and timers are mocked. The
 successful report test reads only in-memory bytes.
 """
 from __future__ import annotations
@@ -114,6 +114,93 @@ class HttpInputSafety(unittest.TestCase):
         if not limit:
             self.skipTest("This Python runtime has no active integer string digit limit")
         self.assert_bad_report_id("9" * (limit + 1))
+
+    def test_api_run_ids_keep_existing_int_compatibility(self):
+        cases = ((None, None), ("", None), ("0", 0), ("-1", -1), ("+7", 7),
+                 (" \t7\r\n", 7), ("００７", 7), ("٧", 7), ("1_0", 10), ("0007", 7))
+        for text, expected in cases:
+            with self.subTest(value=text):
+                self.reset_reads()
+                query = {} if text is None else {"id": text}
+                response, _ = self.request("GET", "/api/run", query, token=self.app.token)
+                self.assertEqual(response[:2], (200, self.run))
+                self.store.get_run.assert_called_once_with(expected)
+                self.store.get_report_snapshot.assert_not_called()
+
+    def test_api_run_out_of_range_ids_return_400_before_storage(self):
+        for value in (-(2 ** 63) - 1, 2 ** 63, -(10 ** 100), 10 ** 100):
+            with self.subTest(value=value):
+                self.reset_reads()
+                response, handler = self.request("GET", "/api/run", {"id": str(value)}, token=self.app.token)
+                self.assertEqual(response[0], 400)
+                self.assertEqual(set(response[1]), {"error"})
+                self.assertTrue(response[1]["error"].startswith("요청 값 오류: "))
+                self.assert_no_dispatch(handler)
+        for token in (None, "wrong-token", "한글"):
+            with self.subTest(token=token):
+                self.reset_reads()
+                response, handler = self.request("GET", "/api/run", {"id": str(2 ** 63)}, token=token)
+                self.assertEqual(response[:2], (403, SESSION_ERROR))
+                self.assert_no_dispatch(handler)
+
+    def test_api_run_not_found_and_storage_errors_remain_404_and_503(self):
+        outcomes = ((None, 404, {"error": "점검 기록이 없습니다."}),
+                    (sqlite3.DatabaseError("sensitive synthetic detail"), 503, {"error": STORAGE_READ_ERROR}),
+                    (OSError("sensitive synthetic detail"), 503, {"error": STORAGE_READ_ERROR}))
+        for error, status, payload in outcomes:
+            with self.subTest(outcome=type(error).__name__):
+                self.reset_reads()
+                if error is None:
+                    self.store.get_run.return_value = None
+                else:
+                    self.store.get_run.side_effect = error
+                response, _ = self.request("GET", "/api/run", {"id": "7"}, token=self.app.token)
+                self.assertEqual(response[:2], (status, payload))
+                self.store.get_run.assert_called_once_with(7)
+                self.cfg.get.assert_not_called()
+
+    def test_api_run_internal_overflow_is_not_reclassified_as_bad_id(self):
+        error = OverflowError("synthetic internal failure")
+        self.store.get_run.side_effect = error
+        handler = self.handler("/api/run", {"id": "7"}, token=self.app.token)
+        with self.assertRaises(OverflowError) as raised:
+            handler.do_GET()
+        self.assertIs(raised.exception, error)
+        self.store.get_run.assert_called_once_with(7)
+        handler._send.assert_not_called()
+
+    def test_api_run_sqlite_boundaries_leave_data_and_subsequent_reads_intact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "synthetic.sqlite3")
+            try:
+                rid = store.save_run(self.run["started"], self.run["finished"], "manual", self.run, {}, None)
+                expected_run = store.get_run(rid)
+                before = tuple(store._db.iterdump())
+                changes = store._db.total_changes
+                cases = ((-(2 ** 63), 404), (2 ** 63 - 1, 404),
+                         (-(2 ** 63) - 1, 400), (2 ** 63, 400),
+                         (-(10 ** 100), 400), (10 ** 100, 400))
+                with patch.object(self.app.engine, "store", store):
+                    for value, status in cases:
+                        with self.subTest(value=value):
+                            response, _ = self.request("GET", "/api/run", {"id": str(value)}, token=self.app.token)
+                            self.assertEqual(response[0], status)
+                            if status == 404:
+                                self.assertEqual(response[1], {"error": "점검 기록이 없습니다."})
+                            else:
+                                self.assertEqual(set(response[1]), {"error"})
+                                self.assertTrue(response[1]["error"].startswith("요청 값 오류: "))
+                            self.assertFalse(store._db.in_transaction)
+                            response, _ = self.request("GET", "/api/run", {"id": str(rid)}, token=self.app.token)
+                            self.assertEqual(response[:2], (200, expected_run))
+                    for query in ({}, {"id": ""}, {"id": "0"}):
+                        response, _ = self.request("GET", "/api/run", query, token=self.app.token)
+                        self.assertEqual(response[:2], (200, expected_run))
+                    self.assertFalse(store._db.in_transaction)
+                    self.assertEqual(store._db.total_changes, changes)
+                    self.assertEqual(tuple(store._db.iterdump()), before)
+            finally:
+                store._db.close()
 
     def test_report_ids_keep_existing_int_compatibility(self):
         cases = ((None, None), ("", None), ("0", 0), ("-1", -1), ("+7", 7),
