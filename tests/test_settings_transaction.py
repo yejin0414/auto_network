@@ -246,14 +246,76 @@ class SettingsTransaction(unittest.TestCase):
         self.assert_original()
 
     def test_legacy_account_is_migrated_and_get_returns_an_independent_copy(self):
-        self.backend.values = {'backbone': json.dumps({'u': 'legacy-user', 'p': 'synthetic-legacy-password'})}
+        for profile in ('backbone', 'aruba'):
+            with self.subTest(profile=profile):
+                self.backend.values = {profile: json.dumps({'u': 'legacy-user', 'p': 'synthetic-legacy-password'})}
+                store = CredentialStore()
+                store.load_saved(['shared'])
+                self.assertEqual(set(self.backend.values), {'shared'})
+                self.assertEqual(json.loads(self.backend.values['shared'])['u'], 'legacy-user')
+                copy_of_credential = store.get()
+                copy_of_credential.password = 'changed-by-caller'
+                self.assertEqual(store.get().password, 'synthetic-legacy-password')
+
+    def test_startup_read_failure_does_not_migrate_lower_priority_accounts(self):
+        for failed_profile in ('shared', 'backbone'):
+            for uncertain in (False, True):
+                with self.subTest(profile=failed_profile, storage_uncertain=uncertain):
+                    self.backend.values = {
+                        p: json.dumps({'u': p + '-user', 'p': 'synthetic-' + p + '-password'})
+                        for p in ('shared', 'backbone', 'aruba')
+                        if p != 'shared' or failed_profile == 'shared'
+                    }
+                    before = dict(self.backend.values)
+                    self.backend.calls.clear()
+                    read = self.backend.get_password
+                    failed = False
+
+                    def fail_once(service, profile):
+                        nonlocal failed
+                        raw = read(service, profile)
+                        if profile == failed_profile and not failed:
+                            failed = True
+                            raise PermissionError('synthetic-read-failure')
+                        return raw
+
+                    store = CredentialStore()
+                    store._storage_uncertain = uncertain
+                    with patch.object(self.backend, 'get_password', side_effect=fail_once):
+                        store.load_saved(['shared'])
+
+                    self.assertTrue(failed)
+                    self.assertEqual(self.backend.values, before)
+                    self.assertEqual([c for c in self.backend.calls if c[0] != 'get'], [])
+                    self.assertIsNone(store.get())
+                    self.assertEqual(store.status(), {})
+                    self.assertEqual(store.storage_uncertain, uncertain)
+
+    def test_startup_load_can_recover_after_transient_read_failure(self):
+        self.backend.values.update(backbone=json.dumps({'u': 'legacy-user', 'p': 'synthetic-legacy-password'}))
+        before = dict(self.backend.values)
+        store = CredentialStore()
+        with patch.object(self.backend, 'get_password', side_effect=OSError('synthetic-read-failure')):
+            store.load_saved(['shared'])
+        self.assertIsNone(store.get())
+        self.assertEqual(self.backend.values, before)
+        self.backend.calls.clear()
+        for reopened in (store, CredentialStore()):
+            reopened.load_saved(['shared'])
+            self.assertEqual(reopened.get(), Credential('old-user', 'synthetic-old-password'))
+            self.assertTrue(reopened.status()['shared']['remembered'])
+        self.assertEqual(self.backend.values, before)
+        self.assertEqual(self.backend.calls, [('get', SERVICE, 'shared')] * 2)
+
+    def test_startup_prefers_shared_without_accessing_legacy_accounts(self):
+        self.backend.values.update(backbone='legacy-backbone', aruba='legacy-aruba')
+        before = dict(self.backend.values)
         store = CredentialStore()
         store.load_saved(['shared'])
-        self.assertEqual(set(self.backend.values), {'shared'})
-        self.assertEqual(json.loads(self.backend.values['shared'])['u'], 'legacy-user')
-        copy_of_credential = store.get()
-        copy_of_credential.password = 'changed-by-caller'
-        self.assertEqual(store.get().password, 'synthetic-legacy-password')
+        self.assertEqual(store.get(), self.creds.get())
+        self.assertTrue(store.status()['shared']['remembered'])
+        self.assertEqual(self.backend.values, before)
+        self.assertEqual(self.backend.calls, [('get', SERVICE, 'shared')])
 
     def test_ephemeral_store_never_accesses_keyring(self):
         with patch('nc.credentials._keyring', side_effect=AssertionError('real keyring forbidden')):

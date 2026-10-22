@@ -95,7 +95,9 @@ class CredentialStore:
             try:
                 raw = kr.get_password(SERVICE, p)
             except Exception:
-                raw = None
+                # A failed read does not prove absence. Do not replace a
+                # possibly existing account with a lower-priority profile.
+                return
             if raw:
                 try:
                     d = json.loads(raw)
