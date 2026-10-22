@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -11,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from nc.collector import CmdResult, DeviceCollection
-from nc.store import Store, validate_database
+from nc.store import Store, _wal_safe_version, validate_database
 
 
 TS = 1700000000
@@ -60,6 +62,137 @@ class StoreCase(unittest.TestCase):
     def commit(self, **kwargs):
         return self.store.commit_run(TS, TS + 1, "test", evaluation(), collections(), {},
                                      events_factory=events, vrrp_factory=vrrp, **kwargs)
+
+
+class SQLiteJournalPolicy(unittest.TestCase):
+    def test_only_fixed_release_branches_allow_wal(self):
+        safe = [(3, 44, 6), (3, 44, 7), (3, 50, 7), (3, 50, 8), (3, 51, 3), (3, 51, 4), (3, 53, 1), (4, 0, 0)]
+        affected = [(3, 7, 0), (3, 44, 5), (3, 45, 0), (3, 49, 1), (3, 50, 0), (3, 50, 6), (3, 51, 0), (3, 51, 2)]
+        for version in safe + affected:
+            with self.subTest(version=version):
+                self.assertEqual(_wal_safe_version(version), version in safe)
+
+    def test_runtime_policy_selects_actual_database_mode(self):
+        cases = [((3, 44, 6), "wal"), ((3, 50, 7), "wal"), ((3, 51, 3), "wal"), ((3, 53, 1), "wal"),
+                 ((3, 44, 5), "delete"), ((3, 49, 1), "delete"), ((3, 50, 6), "delete"), ((3, 51, 2), "delete")]
+        with tempfile.TemporaryDirectory(prefix="netcheck-journal-policy-") as directory:
+            for version, expected in cases:
+                with self.subTest(version=version), patch("nc.store.sqlite3.sqlite_version_info", version):
+                    store = Store(Path(directory) / ("-".join(map(str, version)) + ".sqlite3"))
+                    try:
+                        self.assertEqual(store._db.execute("PRAGMA journal_mode").fetchone()[0], expected)
+                        store.commit_run(TS, TS + 1, "test", evaluation(), collections(), {})
+                        self.assertEqual(store.get_run()["devices"]["bb"]["status"], "ok")
+                    finally:
+                        store._db.close()
+
+    def test_existing_wal_switches_to_delete_without_losing_saved_data(self):
+        with tempfile.TemporaryDirectory(prefix="netcheck-journal-transition-") as directory:
+            path = Path(directory) / "history.sqlite3"
+            with patch("nc.store.sqlite3.sqlite_version_info", (3, 51, 3)):
+                original = Store(path)
+            try:
+                original.commit_run(TS, TS + 1, "test", evaluation(), collections(), {},
+                                    baseline_updates={"bb": {"slots": ["1"]}}, events_factory=events, vrrp_factory=vrrp)
+                before = rows(original._db)
+                self.assertEqual(original._db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+            finally:
+                original._db.close()
+            with patch("nc.store.sqlite3.sqlite_version_info", (3, 49, 1)):
+                reopened = Store(path)
+            try:
+                self.assertEqual(reopened._db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+                self.assertEqual(rows(reopened._db), before)
+                self.assertEqual(reopened.get_raw(1, "bb", "version")["output"], "Synthetic output")
+            finally:
+                reopened._db.close()
+
+    def test_locked_wal_transition_fails_without_schema_writes_and_closes_handle(self):
+        with tempfile.TemporaryDirectory(prefix="netcheck-journal-busy-") as directory:
+            path = Path(directory) / "history.sqlite3"
+            keeper = sqlite3.connect(path, timeout=0)
+            self.addCleanup(keeper.close)
+            keeper.execute("PRAGMA journal_mode=WAL")
+            keeper.execute("CREATE TABLE sentinel(value TEXT)")
+            keeper.execute("INSERT INTO sentinel VALUES ('preserve')")
+            keeper.commit()
+            keeper.execute("BEGIN")
+            keeper.execute("SELECT * FROM sentinel").fetchall()
+            blocked = sqlite3.connect(path, timeout=0)
+            started = time.monotonic()
+            try:
+                with patch("nc.store.sqlite3.connect", return_value=blocked), \
+                        patch("nc.store.sqlite3.sqlite_version_info", (3, 49, 1)), \
+                        patch("nc.store._INIT_TIMEOUT", 0.03):
+                    with self.assertRaises(sqlite3.OperationalError) as caught:
+                        Store(path)
+                self.assertIn(caught.exception.sqlite_errorcode & 0xff, (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED))
+                self.assertLess(time.monotonic() - started, 1)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    blocked.execute("SELECT 1")
+                self.assertEqual(keeper.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("sentinel",)])
+                self.assertEqual(keeper.execute("SELECT * FROM sentinel").fetchall(), [("preserve",)])
+            finally:
+                blocked.close()
+                keeper.rollback()
+                keeper.close()
+            path.unlink()  # Failed initialization must not leak a Windows handle.
+
+    def test_delete_transition_recovers_committed_uncheckpointed_wal(self):
+        with tempfile.TemporaryDirectory(prefix="netcheck-journal-recovery-") as directory:
+            path = Path(directory) / "history.sqlite3"
+            seed = sqlite3.connect(path)
+            seed.execute("CREATE TABLE sentinel(value TEXT)")
+            seed.close()
+            # A disposable child exits after commit without Connection.close(),
+            # leaving real committed WAL pages rather than a checkpointed file.
+            subprocess.run([sys.executable, "-c", """
+import os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute('PRAGMA journal_mode=WAL')
+db.execute('PRAGMA wal_autocheckpoint=0')
+db.execute("INSERT INTO sentinel VALUES ('committed WAL evidence')")
+db.commit()
+os._exit(0)
+""", str(path)], check=True, timeout=10, capture_output=True)
+            self.assertGreater(Path(str(path) + "-wal").stat().st_size, 32)
+            main_only = Path(directory) / "main-only.sqlite3"
+            main_only.write_bytes(path.read_bytes())
+            copied = sqlite3.connect(main_only)
+            try:
+                self.assertEqual(copied.execute("SELECT * FROM sentinel").fetchall(), [])
+            finally:
+                copied.close()
+            with patch("nc.store.sqlite3.sqlite_version_info", (3, 49, 1)):
+                recovered = Store(path)
+            try:
+                self.assertEqual(recovered._db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+                self.assertEqual([tuple(row) for row in recovered._db.execute("SELECT * FROM sentinel")],
+                                 [("committed WAL evidence",)])
+                self.assertEqual(recovered._db.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            finally:
+                recovered._db.close()
+
+    def test_unconfirmed_mode_fails_before_schema_creation(self):
+        class WrongModeConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql == "PRAGMA journal_mode":
+                    return super().execute("SELECT 'wal'")
+                return super().execute(sql, parameters)
+        with tempfile.TemporaryDirectory(prefix="netcheck-journal-unconfirmed-") as directory:
+            path = Path(directory) / "history.sqlite3"
+            db = sqlite3.connect(path, timeout=0, factory=WrongModeConnection)
+            with patch("nc.store.sqlite3.connect", return_value=db), \
+                    patch("nc.store.sqlite3.sqlite_version_info", (3, 49, 1)):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "DELETE"):
+                    Store(path)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                db.execute("SELECT 1")
+            check = sqlite3.connect(path)
+            try:
+                self.assertEqual(check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [])
+            finally:
+                check.close()
 
 
 class InventoryLifecycle(StoreCase):

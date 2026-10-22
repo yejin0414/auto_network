@@ -142,6 +142,11 @@ class SQLiteBackupAndCorruption(unittest.TestCase):
             path = Path(directory) / "history.sqlite3"
             store = Store(path)
             try:
+                # This isolated fixture tests backup of pending WAL pages, not
+                # Store's runtime journal policy. Even on affected SQLite there
+                # is only one connection to this source, with no concurrent
+                # writer or checkpoint; the copied DB is a different file.
+                self.assertEqual(store._db.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
                 store._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
                 run_id = store.save_run(TS, TS + 1, "test", evaluation(), collections(), {})
                 self.assertGreater(Path(str(path) + "-wal").stat().st_size, 32)

@@ -23,7 +23,7 @@ require_disposable_windows()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.mock_ssh import MockDevice  # noqa: E402
 from tests.test_e2e_ssh import aruba, comware  # noqa: E402
-from nc.store import validate_database  # noqa: E402
+from nc.store import validate_database, _wal_safe_version  # noqa: E402
 
 EXE = Path(sys.argv[1]).resolve()
 PORT = 8799
@@ -104,6 +104,15 @@ def verify_failed_combined_save(token, config_path):
 
 
 def verify_database_backup_and_cleanup(token, config, run):
+    live_path = (EXE.parent / "data" / "netcheck.sqlite3").resolve()
+    live = sqlite3.connect(live_path.as_uri() + "?mode=ro", uri=True)
+    try:
+        actual_mode = live.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        expected_mode = "wal" if _wal_safe_version(sqlite3.sqlite_version_info) else "delete"
+        assert actual_mode == expected_mode, f"EXE DB 저널 모드: {actual_mode}, 예상: {expected_mode}"
+        print("Windows EXE DB journal mode:", actual_mode, "SQLite:", sqlite3.sqlite_version)
+    finally:
+        live.close()
     result = json.loads(req("/api/backup", {}, token))
     backup = Path(result["path"])
     assert backup.parent.resolve() == (EXE.parent / "data" / "backups").resolve()

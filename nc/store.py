@@ -64,6 +64,17 @@ _REQUIRED_COLUMNS = {
 log = logging.getLogger("netcheck")
 
 
+def _wal_safe_version(version: tuple[int, ...]) -> bool:
+    """SQLite releases containing the WAL-reset corruption fix or its backport.
+
+    https://www.sqlite.org/wal.html#the_wal_reset_bug
+    Unknown/unpatched older branches use the rollback journal instead.
+    """
+    return (version >= (3, 51, 3)
+            or version[:2] == (3, 50) and version >= (3, 50, 7)
+            or version[:2] == (3, 44) and version >= (3, 44, 6))
+
+
 def _deadline(timeout: float) -> float:
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("백업 제한 시간은 양수여야 합니다.")
@@ -137,11 +148,17 @@ class Store:
 
     def _initialize(self) -> None:
         deadline = time.monotonic() + _INIT_TIMEOUT
+        journal_mode = "WAL" if _wal_safe_version(sqlite3.sqlite_version_info) else "DELETE"
         while True:
             try:
-                # WAL must be selected outside a transaction and can return
-                # SQLITE_BUSY immediately during another connection's startup.
-                self._db.execute("PRAGMA journal_mode=WAL").fetchall()
+                # Change modes before any transaction or schema writes. A busy
+                # WAL-to-DELETE transition must fail startup, never leave this
+                # runtime operating in the affected WAL mode.
+                selected = self._db.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()
+                effective = self._db.execute("PRAGMA journal_mode").fetchone()
+                if (not selected or str(selected[0]).upper() != journal_mode
+                        or not effective or str(effective[0]).upper() != journal_mode):
+                    raise sqlite3.OperationalError(f"SQLite 저널 모드 {journal_mode} 전환을 확인하지 못했습니다.")
                 self._db.execute("BEGIN IMMEDIATE")
                 # executescript() would implicitly commit BEGIN IMMEDIATE.
                 # Keep all DDL, the schema check and ALTER in one transaction.

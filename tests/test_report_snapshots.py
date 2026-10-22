@@ -213,8 +213,8 @@ class StoreInitializationRetries(unittest.TestCase):
         error.sqlite_errorcode = code
         return error
 
-    def test_transient_busy_during_wal_or_schema_retries_successfully(self):
-        for statement, code in [('PRAGMA journal_mode=WAL', sqlite3.SQLITE_BUSY),
+    def test_transient_busy_during_journal_selection_or_schema_retries_successfully(self):
+        for statement, code in [('PRAGMA journal_mode=', sqlite3.SQLITE_BUSY),
                                 ('ALTER TABLE', sqlite3.SQLITE_LOCKED)]:
             with self.subTest(statement=statement), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / 'transient.sqlite3'

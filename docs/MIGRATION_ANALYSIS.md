@@ -25,7 +25,8 @@ flowchart LR
 - `nc/parsers.py`와 `nc/evaluate.py`는 CPU/메모리, 슬롯·전원·팬, 인터페이스, LACP,
   OSPF, VRRP, MM 상태, WLC 멤버십·Client 분배를 해석합니다. 정상/주의/장애/확인 불가를 구분합니다.
 - `nc/server.py`는 루프백 HTTP 서버와 토큰 인증 API를 제공합니다. 웹은 외부 CDN 없이 동작하는 HTML/CSS/JS입니다.
-- `nc/store.py`는 WAL 모드 SQLite에 점검 회차, 결과, 압축 원본 응답, 기준값, 이벤트, VRRP 이력을 저장합니다.
+- `nc/store.py`는 SQLite에 점검 회차, 결과, 압축 원본 응답, 기준값, 이벤트, VRRP 이력을 저장합니다.
+  WAL reset 수정 버전은 WAL, 그 밖의 런타임은 rollback journal(`DELETE`)을 사용합니다.
   SQL 값은 바인딩되며 쓰기에는 잠금과 트랜잭션을 사용합니다.
 - `nc/report.py`는 HTML, `nc/excel.py`는 Excel을 만듭니다. `appwindow`, `instance`, `wintask`,
   `credentials`, `notify`는 Windows 창·중복 실행·예약작업·자격 증명·알림을 담당합니다.
@@ -84,6 +85,7 @@ P2는 운영 편의·진단·일부 이력 정확성 문제입니다. 재현에�
 | F27 P2 | 장비를 삭제해도 기준값이 남고, 삭제 전 시작한 점검이 기준값을 다시 쓸 수 있음. 같은 ID 재추가/주소 변경 시 이전 상태와 비교 | 현재 장비 목록과 기준값 동기화, 설정에 장비별 수명 식별값 저장, DB revision으로 오래된 회차의 기준값 갱신 차단. 과거 이력은 보존 |
 | F28 P1 | 회차 저장 후 기준값/이벤트/VRRP가 각각 확정되어 중간 DB 실패 시 일부만 남음. 보관 정리 실패가 성공한 점검을 실패로 표시 | 전체 점검 데이터를 단일 트랜잭션으로 저장. 저장 실패 rollback과 저장 후 백업/보관 정리 경고를 구분. 읽기 실패도 빈 이력으로 위장하지 않음 |
 | F29 P2 | 온라인 백업 및 검증된 복원 경로 없음. WAL 사용 중 DB 파일만 복사하면 최신 확정 내용이 빠질 수 있음 | SQLite online backup, 무결성/스키마 확인, 새 경로에만 확정, 24시간 자동/수동 백업과 최근 7개 보관, 별도 새 파일 복원/검증 명령 |
+| F30 P1 | Windows Python 3.12.10의 SQLite 3.49.1은 WAL reset 손상 문제 미수정. 여러 연결에서 checkpoint/write가 겹칠 때 손상 가능 | 수정이 확인된 SQLite만 WAL 허용. 나머지는 DELETE로 전환 후 실효 모드를 확인하고, 전환 실패는 시작 중단. 버전 경계·기존 WAL 전환·잠금 실패·Windows EXE 실제 모드 검증 |
 
 주요 회귀 테스트: `tests/test_collection_regressions.py`, `tests/test_app_regressions.py`,
 `tests/test_windows_build_tools.py`. 기존 E2E는 실제 Netmiko로 루프백 SSH/Telnet Mock에 연결합니다.
@@ -220,7 +222,7 @@ Windows 성공 여부는 이 변경의 PR 및 main Actions 실행 결과에서 �
 
 ## 장비 기준값 수명과 DB 장애·백업 후속 수정
 
-F27~F29는 main `9fb5254` 이후 별도 PR에서 검증합니다.
+F27~F30은 main `9fb5254` 이후 별도 PR에서 검증합니다.
 
 - 삭제·접속 대상/역할/클러스터 변경 때 해당 장비 기준값을 정리합니다. 비활성화·이름·대표 표시 변경은 유지합니다.
   WLC IP 연결형태 기준도 현재 목록에 맞춥니다. 과거 회차/원본/이벤트/VRRP 기록은 보존합니다.
@@ -238,8 +240,13 @@ F27~F29는 main `9fb5254` 이후 별도 PR에서 검증합니다.
   복원은 기존 DB 및 WAL/SHM 파일이 없는 새 경로만 허용하며 원본은 보존합니다.
 - Windows EXE 회귀에는 백업 API → EXE 검증/새 파일 복원 → 덮어쓰기 거부, 장비 삭제 후 기준값 정리와
   과거 회차/원본 보존을 포함합니다. 기존 Mock SSH/Telnet·계정·창·작업 스케줄러 검사도 유지합니다.
+- 첫 Windows CI는 283개 검사와 EXE 검증을 모두 통과했지만, 로그에서 SQLite 3.49.1을 확인했습니다.
+  [SQLite 공식 WAL reset 설명](https://www.sqlite.org/wal.html#the_wal_reset_bug)에 따라
+  3.51.3 이상 및 3.50.7+/3.44.6+ 해당 유지보수 계열만 WAL을 사용하고 나머지는 DELETE로 선택합니다.
+  원자 트랜잭션 자체가 SQLite 내부 버그를 해결하는 것은 아닙니다. 같은 DB의 여러 쓰기 연결은
+  앱의 객체별 잠금 밖에서도 생길 수 있으므로 실제 저널 모드를 확인하며, 실패하면 연결을 닫습니다.
 
-macOS 전체 단위·통합 검사는 283개 중 281개 통과, Windows 전용 2개 건너뜀이며 UI 저장/백업 회귀도 통과했습니다.
+macOS 최종 전체 단위·통합 검사는 289개 중 287개 통과, Windows 전용 2개 건너뜀이며 UI 저장/백업 회귀도 통과했습니다.
 Windows 결과는 해당 PR과 병합 커밋의 Actions에서 별도로 확인합니다. 초기 전체 실행의 취소 회귀 실패는
 기존 가짜 저장소의 새 읽기 API 반환값을 명시하고 원자 저장 미호출을 검사하도록 수정한 뒤 재실행해 통과했습니다.
 
@@ -263,7 +270,7 @@ Windows 결과는 해당 PR과 병합 커밋의 Actions에서 별도로 확인�
 
 ## 실제 변경 파일 목록
 
-최초 이전 시 원본 스냅샷과 바이트 비교한 목록입니다. 이후 F18~F29 후속 수정 파일은
+최초 이전 시 원본 스냅샷과 바이트 비교한 목록입니다. 이후 F18~F30 후속 수정 파일은
 각 PR의 Files changed와 위 회귀 검증 설명을 참고하세요.
 
 | 구분 | 경로 |
