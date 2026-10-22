@@ -7,6 +7,10 @@ from unittest.mock import Mock, patch
 from nc.engine import Engine, next_slot
 
 
+# Keep calendar alignment safely inside the Windows timestamp range in every timezone.
+BASE = 1_700_000_000
+
+
 class SchedulerRefresh(unittest.TestCase):
     def setUp(self):
         self.config = {
@@ -14,10 +18,10 @@ class SchedulerRefresh(unittest.TestCase):
             "devices": [{"id": "synthetic", "enabled": True}],
         }
         self.engine = Engine(SimpleNamespace(get=lambda: copy.deepcopy(self.config)), Mock(), Mock(), Mock(), demo=True)
-        self.engine._last_auto_start = 1000
+        self.engine._last_auto_start = BASE + 1000
         self.engine.start_check = Mock(return_value=True)
 
-    def step(self, after_wait=None, now=1100):
+    def step(self, after_wait=None, now=BASE + 1100):
         with patch("nc.engine.time.time", return_value=now), \
                 patch.object(self.engine._wake, "wait", side_effect=after_wait or (lambda _: False)), \
                 patch("nc.engine.time.sleep"):
@@ -29,7 +33,7 @@ class SchedulerRefresh(unittest.TestCase):
             self.engine.reschedule()
         self.step(changed)
         self.step()
-        self.assertEqual(self.engine.next_run, 2800)
+        self.assertEqual(self.engine.next_run, BASE + 2800)
         self.engine.start_check.assert_not_called()
 
     def test_alignment_saved_while_waiting_applies_on_next_step(self):
@@ -38,14 +42,14 @@ class SchedulerRefresh(unittest.TestCase):
             self.engine.reschedule()
         self.step(changed)
         self.step()
-        self.assertEqual(self.engine.next_run, next_slot(1100, 30, True, 1000))
+        self.assertEqual(self.engine.next_run, next_slot(BASE + 1100, 30, True, BASE + 1000))
 
     def test_disable_during_wait_prevents_due_check(self):
         def disabled(_):
             self.config["schedule"]["enabled"] = False
             self.engine.reschedule()
         self.step(disabled)
-        self.step(now=5000)
+        self.step(now=BASE + 5000)
         self.assertIsNone(self.engine.next_run)
         self.engine.start_check.assert_not_called()
 
@@ -56,10 +60,10 @@ class SchedulerRefresh(unittest.TestCase):
                 self.engine.reschedule()
         self.step(changed)
         self.step()
-        self.assertEqual(self.engine.next_run, 2800)
+        self.assertEqual(self.engine.next_run, BASE + 2800)
 
     def test_change_while_wake_is_cleared_is_not_lost(self):
-        self.engine.next_run = 4600
+        self.engine.next_run = BASE + 4600
         self.engine._schedule_signature = (True, 60, False, True)
         clear = self.engine._wake.clear
         def change_and_clear():
@@ -68,22 +72,22 @@ class SchedulerRefresh(unittest.TestCase):
             clear()
         with patch.object(self.engine._wake, "clear", side_effect=change_and_clear):
             self.step()
-        self.assertEqual(self.engine.next_run, 2800)
+        self.assertEqual(self.engine.next_run, BASE + 2800)
 
     def test_change_after_snapshot_defers_due_check(self):
         def clock():
             self.config["schedule"]["enabled"] = False
             self.engine.reschedule()
-            return 5000
+            return BASE + 5000
         with patch("nc.engine.time.time", side_effect=clock), patch("nc.engine.time.sleep"):
             self.engine._scheduler_step()
         self.engine.start_check.assert_not_called()
-        self.step(now=5000)
+        self.step(now=BASE + 5000)
         self.assertIsNone(self.engine.next_run)
 
     def test_no_enabled_devices_does_not_start_empty_auto_run(self):
         self.config["devices"][0]["enabled"] = False
-        self.step(now=5000)
+        self.step(now=BASE + 5000)
         self.assertIsNone(self.engine.next_run)
         self.engine.start_check.assert_not_called()
 

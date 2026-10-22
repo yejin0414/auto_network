@@ -315,13 +315,22 @@ class ClusterFallback(unittest.TestCase):
 
     def test_blocked_second_command_preserves_first_and_rejects_late_result(self):
         session = self.blocking_session("load")
-        clusters = self.bounded_collect()
+        wall_now = 1761123600.0
+        # Equal wall-clock readings are possible on Windows. Adding a 150 ms
+        # budget to an epoch float then subtracting it yields 150.000095 ms.
+        # Keep the real monotonic watchdog, but test its wall-clock projection
+        # against that exact representable bound rather than an arbitrary epsilon.
+        with patch("nc.engine.time.time", return_value=wall_now):
+            clusters = self.bounded_collect()
         self.assertTrue(session.entered.is_set())
         self.assertTrue(session.aborted.wait(1))
         self.assertTrue(clusters["A"]["membership"].ok)
         self.assertFalse(clusters["A"]["load"].ok)
         self.assertIn("시간 예산", clusters["A"]["load"].error)
-        self.assertTrue(all(timeout <= 0.15 for timeout in session.timeouts))
+        projected_budget = (wall_now + self.engine.cluster_fallback_seconds) - wall_now
+        for timeout in session.timeouts:
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, projected_budget)
         before = copy.deepcopy((clusters, self.collections, self.engine.progress))
         session.release.set()
         self.assertTrue(session.closed.wait(1))
@@ -427,6 +436,18 @@ class ClusterFallback(unittest.TestCase):
 
 
 class CollectorCancellation(unittest.TestCase):
+    def test_fractional_timeout_matches_exact_epoch_deadline_difference(self):
+        wall_now, budget = 1761123600.0, 0.15
+        session = Mock()
+        session.run.return_value = "192.0.2.11 100 100"
+        with patch("nc.collector.time.time", return_value=wall_now):
+            actual = run_spec(session, SPEC["load"], {}, deadline=wall_now + budget)
+        requested = session.run.call_args.args[1]
+        self.assertTrue(actual.ok)
+        self.assertEqual(requested, (wall_now + budget) - wall_now)
+        # Reproduce the exact strict-bound failure without relying on OS timing.
+        self.assertGreater(requested, budget)
+
     def test_cancellation_prevents_alternate_command(self):
         cancelled = threading.Event()
         session = Mock()
