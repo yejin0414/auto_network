@@ -258,12 +258,13 @@ def build_workbook(run: dict, site: str, thresholds: dict, raw: Callable[[str, s
     # ------------------------------------------------------------------ 점검 항목
     ws = wb.create_sheet("점검 항목")
     sh = Sheet(ws, "점검 항목별 결과", [("장비", 16), ("구분", 8), ("항목", 16), ("결과", 10), ("내용", 60),
-                                        ("근거", 60), ("명령", 30)], sub)
+                                        ("근거", 60), ("명령 / 출처", 30)], sub)
     for d in devs:
         for ch in d["checks"]:
             sh.add([d["name"], _kind(d), ch["label"], LEVEL_LABEL[ch["level"]], ch["summary"],
-                    "\n".join(ch.get("evidence", [])), ch.get("command") or ch.get("source", "")],
-                   level=ch["level"], level_col=4, wrap={5, 6})
+                    "\n".join(ch.get("evidence", [])),
+                    "\n".join(x for x in (ch.get("command"), f"출처: {ch['source']}" if ch.get("source") else "") if x)],
+                   level=ch["level"], level_col=4, wrap={5, 6, 7})
     sh.finish()
 
     # ------------------------------------------------------------------ 원본 출력

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import socket
 import time
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -248,6 +249,9 @@ def collect_device(
     progress: Callable[[str], None] | None = None,
     deadline: float | None = None,
     holder: dict | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    on_result: Callable[[CmdResult], None] | None = None,
 ) -> DeviceCollection:
     """deadline(시각)을 넘기면 남은 명령은 실행하지 않고 '시간 초과로 생략'으로 남깁니다.
     holder가 있으면 열린 세션을 holder["session"]에 넣어 밖에서 강제 종료할 수 있게 합니다."""
@@ -255,6 +259,9 @@ def collect_device(
     from .config import ssh_for
 
     ssh = ssh_for(device, ssh)  # 백본 / 컨트롤러 대기 시간 분리
+    def stopped() -> bool:
+        return bool(cancelled and cancelled()) or (deadline is not None and time.time() >= deadline)
+
     dc = DeviceCollection(device_id=device["id"], connected=False, started=time.time())
     if cred is None:
         dc.error = "접속 계정이 입력되지 않았습니다. 설정 → 접속 계정에서 입력하세요."
@@ -265,9 +272,15 @@ def collect_device(
     session = None
     last: ConnectFailure | None = None
     for attempt in range(retries + 1):
+        if stopped():
+            last = ConnectFailure("timeout", "시간 초과 또는 점검 중단으로 접속을 생략했습니다.")
+            break
         try:
             progress(f"{device['name']} 접속 중")
-            session = driver.open(device, cred, ssh)
+            connect_ssh = dict(ssh)
+            if deadline is not None:
+                connect_ssh["connect_timeout"] = max(1, min(ssh["connect_timeout"], math.ceil(deadline - time.time())))
+            session = driver.open(device, cred, connect_ssh)
             if holder is not None:
                 holder["session"] = session
             break
@@ -275,9 +288,11 @@ def collect_device(
             last = exc
             if exc.kind == "auth":
                 break  # 계정 잠금 방지: 인증 실패는 재시도하지 않음
-            if deadline and time.time() > deadline:
+            if stopped():
                 break
-            time.sleep(min(2.0, 0.5 * (attempt + 1)))
+            retry_at = time.monotonic() + min(2.0, 0.5 * (attempt + 1))
+            while not stopped() and time.monotonic() < retry_at:
+                time.sleep(max(0.0, min(0.05, retry_at - time.monotonic())))
     if session is None:
         dc.error = str(last) if last else "접속 실패"
         dc.error_kind = last.kind if last else "connection"
@@ -285,13 +300,21 @@ def collect_device(
         return dc
     dc.connected = True
     try:
+        if stopped():
+            abort = getattr(session, "abort", None)
+            if abort:
+                abort()  # open()이 취소 뒤 돌아온 세션도 명령 실행 전에 종료
         for spec in specs:
-            if deadline and time.time() > deadline:
+            if stopped():
                 dc.results[spec.id] = CmdResult(spec.id, spec.label, spec.commands[0], "", False,
-                                                "시간 초과로 생략(장비 응답이 너무 느려 이 장비 점검 제한 시간을 넘김)",
+                                                "시간 초과 또는 점검 중단으로 생략",
                                                 0.0, spec.optional)
                 continue
-            dc.results[spec.id] = run_spec(session, spec, ssh)
+            dc.results[spec.id] = run_spec(session, spec, ssh, deadline=deadline, cancelled=cancelled)
+            if stopped():
+                continue
+            if on_result:
+                on_result(dc.results[spec.id])
             progress(f"{device['name']} {spec.label}")
     finally:
         session.close()
@@ -299,7 +322,8 @@ def collect_device(
     return dc
 
 
-def run_spec(session: Session, spec: CommandSpec, ssh: dict) -> CmdResult:
+def run_spec(session: Session, spec: CommandSpec, ssh: dict, *, deadline: float | None = None,
+             cancelled: Callable[[], bool] | None = None) -> CmdResult:
     """대체 명령을 차례로 시도. 거부되거나(expect가 있을 때) 기대한 값이 없으면 다음 명령."""
     timeout = max(spec.timeout or 0, int(ssh.get("command_timeout", 60)))
     started = time.time()
@@ -307,12 +331,16 @@ def run_spec(session: Session, spec: CommandSpec, ssh: dict) -> CmdResult:
     output, error, used = "", "", spec.commands[0]
     for cmd in spec.commands:
         used = cmd
+        if (cancelled and cancelled()) or (deadline is not None and time.time() >= deadline):
+            return CmdResult(spec.id, spec.label, cmd, "", False, "시간 초과 또는 점검 중단으로 생략",
+                             round(time.time() - started, 2), spec.optional)
         reason = check_console_command(cmd)
         if reason:
             return CmdResult(spec.id, spec.label, cmd, "", False, reason,
                              round(time.time() - started, 2), spec.optional)
         try:
-            output = clean(session.run(cmd, timeout))
+            remaining = min(timeout, deadline - time.time()) if deadline is not None else timeout
+            output = clean(session.run(cmd, max(0.001, remaining)))
         except Exception as exc:
             output, error = "", f"명령 실패: {type(exc).__name__} {safe_error(exc)}"
             continue

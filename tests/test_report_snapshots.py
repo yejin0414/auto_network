@@ -11,8 +11,9 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import Mock, patch
 
 from openpyxl import load_workbook
@@ -167,16 +168,131 @@ class LegacyDatabaseMigration(unittest.TestCase):
 
     def test_independent_store_openers_do_not_duplicate_schema_upgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'concurrent.sqlite3'
-            self.legacy_file(path)
-            def open_read_close(_):
-                store = Store(path)
-                try:
-                    return store.get_run(1)['summary']['overall']
-                finally:
-                    store._db.close()
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                self.assertEqual(list(pool.map(open_read_close, range(3))), ['warn'] * 3)
+            for legacy in [False, True]:
+                with self.subTest(legacy=legacy):
+                    path = Path(tmp) / f'concurrent-{legacy}.sqlite3'
+                    if legacy:
+                        self.legacy_file(path)
+                    ready = Barrier(3, timeout=5)
+
+                    def open_read_close(_):
+                        ready.wait()
+                        store = Store(path)
+                        try:
+                            columns = [r['name'] for r in store._db.execute('PRAGMA table_info(runs)')]
+                            self.assertEqual(columns.count('report_context'), 1)
+                            run = store.get_run(1)
+                            return run['summary']['overall'] if run else None
+                        finally:
+                            store._db.close()
+
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        self.assertEqual(list(pool.map(open_read_close, range(3))),
+                                         ['warn' if legacy else None] * 3)
+
+
+class _InitializationConnection(sqlite3.Connection):
+    """Inject SQLite errors while retaining a real temporary database handle."""
+    before_execute = None
+    closed = False
+
+    def execute(self, sql, parameters=()):
+        if self.before_execute:
+            self.before_execute(sql)
+        return super().execute(sql, parameters)
+
+    def close(self):
+        super().close()
+        self.closed = True
+
+
+class StoreInitializationRetries(unittest.TestCase):
+    @staticmethod
+    def database_error(code, message='database is locked'):
+        error = sqlite3.OperationalError(message)
+        error.sqlite_errorcode = code
+        return error
+
+    def test_transient_busy_during_wal_or_schema_retries_successfully(self):
+        for statement, code in [('PRAGMA journal_mode=WAL', sqlite3.SQLITE_BUSY),
+                                ('ALTER TABLE', sqlite3.SQLITE_LOCKED)]:
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'transient.sqlite3'
+                LegacyDatabaseMigration().legacy_file(path)
+                with closing(sqlite3.connect(path, timeout=0, factory=_InitializationConnection)) as db:
+                    failures = []
+
+                    def fail_once(sql):
+                        if sql.startswith(statement) and not failures:
+                            failures.append(sql)
+                            raise self.database_error(code)
+
+                    db.before_execute = fail_once
+                    with patch('nc.store.sqlite3.connect', return_value=db), patch('nc.store.time.sleep') as sleep:
+                        store = Store(path)
+                    self.assertEqual(len(failures), 1)
+                    sleep.assert_called_once()
+                    self.assertEqual(store.get_run(1)['overall'], 'warn')
+                    columns = [r['name'] for r in db.execute('PRAGMA table_info(runs)')]
+                    self.assertEqual(columns.count('report_context'), 1)
+                    self.assertEqual(db.execute('PRAGMA busy_timeout').fetchone()[0], 30000)
+
+    def test_persistent_busy_stops_at_deadline_and_closes_connection(self):
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as cleanup:
+            path = Path(tmp) / 'busy.sqlite3'
+            db = sqlite3.connect(path, timeout=0, factory=_InitializationConnection)
+            cleanup.callback(db.close)
+            elapsed = [0.0]
+            busy = self.database_error(sqlite3.SQLITE_BUSY | 0x100)
+            db.before_execute = Mock(side_effect=busy)
+
+            def advance(seconds):
+                elapsed[0] += seconds
+
+            with patch('nc.store.sqlite3.connect', return_value=db), \
+                    patch('nc.store._INIT_TIMEOUT', 0.1), \
+                    patch('nc.store.time.monotonic', side_effect=lambda: elapsed[0]), \
+                    patch('nc.store.time.sleep', side_effect=advance) as sleep:
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    Store(path)
+            self.assertIs(raised.exception, busy)
+            self.assertEqual(elapsed[0], 0.1)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(db.before_execute.call_count, 3)
+            self.assertTrue(db.closed)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                db.cursor()
+            # Keep the exception/connection referenced while unlinking: Windows
+            # must not need garbage collection to release the failed startup.
+            path.unlink()
+
+    def test_nonbusy_failure_rolls_back_schema_and_closes_without_retry(self):
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as cleanup:
+            path = Path(tmp) / 'invalid.sqlite3'
+            LegacyDatabaseMigration().legacy_file(path)
+            db = sqlite3.connect(path, timeout=0, factory=_InitializationConnection)
+            cleanup.callback(db.close)
+            error = self.database_error(sqlite3.SQLITE_ERROR, 'injected schema failure')
+
+            def fail_alter(sql):
+                if sql.startswith('ALTER TABLE'):
+                    self.assertTrue(db.in_transaction)
+                    raise error
+
+            db.before_execute = fail_alter
+            with patch('nc.store.sqlite3.connect', return_value=db), patch('nc.store.time.sleep') as sleep:
+                with self.assertRaises(sqlite3.OperationalError) as raised:
+                    Store(path)
+            self.assertIs(raised.exception, error)
+            sleep.assert_not_called()
+            self.assertTrue(db.closed)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                db.cursor()
+            with closing(sqlite3.connect(path)) as reopened:
+                tables = {row[0] for row in reopened.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertEqual(tables, {'runs', 'device_results', 'sqlite_sequence'})
+                self.assertEqual(reopened.execute('SELECT COUNT(*) FROM runs').fetchone()[0], 1)
+                self.assertNotIn('report_context', [r[1] for r in reopened.execute('PRAGMA table_info(runs)')])
 
 
 class ReportSnapshotExports(unittest.TestCase):

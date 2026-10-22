@@ -38,7 +38,9 @@ def render(run: dict, site: str) -> str:
         items = []
         for c in d["checks"]:
             ev = "".join(f"<div class='ev'>{_e(x)}</div>" for x in c.get("evidence", []))
-            cmd = f"<code>{_e(c['command'])}</code>" if c.get("command") else (f"<small>출처: {_e(c['source'])}</small>" if c.get("source") else "")
+            cmd = f"<code>{_e(c['command'])}</code>" if c.get("command") else ""
+            if c.get("source"):
+                cmd += f"<div><small>출처: {_e(c['source'])}</small></div>"
             items.append(
                 f"<tr><td style='color:{COLOR[c['level']]};font-weight:600'>{LEVEL_LABEL[c['level']]}</td>"
                 f"<td>{_e(c['label'])}</td><td>{_e(c['summary'])}{ev}</td><td>{cmd}</td></tr>"

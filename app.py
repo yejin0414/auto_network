@@ -141,17 +141,14 @@ def main() -> int:
     engine.start_scheduler()
 
     # 창을 닫아도 자동 점검: Windows 작업 스케줄러 등록/갱신(설정 저장 때마다 다시 맞춤)
-    def sync_background(conf_now: dict) -> None:
-        if args.demo:
-            return
+    background_sync = None
+    if not args.demo:
         from nc import wintask
+        from nc.schedule_sync import ScheduleSynchronizer
 
-        def run() -> None:
-            app.background = wintask.sync(conf_now["schedule"])
-        threading.Thread(target=run, name="netcheck-wintask", daemon=True).start()
-
-    app.on_config_saved = sync_background
-    sync_background(conf)
+        background_sync = ScheduleSynchronizer(lambda: cfg.get()["schedule"], wintask.sync, app.publish_background)
+        app.on_config_saved = background_sync.request
+        background_sync.request()
     url = f"http://{host}:{port}/"
     logging.info("무선망 통합 점검 센터 v%s%s 시작 (%s)", VERSION, " 데모" if args.demo else "", url)
     threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.5}, name="netcheck-http", daemon=True).start()
@@ -191,17 +188,24 @@ def main() -> int:
         pass
     # 정리 후 프로세스를 확실히 끝냄(점검 중인 작업이 있어도 남지 않도록)
     logging.info("종료합니다")
+    exit_code = 0
     try:
         if watch:
             watch.stop()
         engine.stop()
+        app.begin_shutdown()
         httpd.shutdown()
+        if background_sync is not None:
+            if not background_sync.close():
+                exit_code = 1
+        # Keep the port reserved until task updates finish, so a replacement
+        # process cannot race the old process while registering its own path.
         httpd.server_close()
         kill_tree(proc)
         clear_instance(demo=args.demo)
         logging.shutdown()
     finally:
-        os._exit(0)
+        os._exit(exit_code)
 
 
 def ask_yes_no(text: str) -> bool:
