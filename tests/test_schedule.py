@@ -10,6 +10,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import nc.engine as E
 from nc.config import ConfigStore
@@ -38,19 +39,58 @@ def make_engine(tmp: Path, schedule: dict, speed: float = 0.0):
 
 class Scheduler(unittest.TestCase):
     def test_runs_repeatedly(self):
-        orig = E.next_slot
-        E.next_slot = lambda now, i, a, last: (now + 1) if last is None else last + 2
-        try:
-            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
-                eng = make_engine(Path(t), {"enabled": True, "interval_minutes": 5, "align_to_clock": False})
-                eng.start_scheduler()
-                time.sleep(8)
-                eng.stop()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
+            eng = make_engine(Path(t), {"enabled": True, "interval_minutes": 5, "align_to_clock": False})
+            threads = []
+            real_thread = threading.Thread
+
+            def track_thread(*args, **kwargs):
+                worker = real_thread(*args, **kwargs)
+                threads.append(worker)
+                return worker
+
+            started = time.monotonic()
+            completed = False
+            try:
+                with patch.object(E, "next_slot", lambda now, i, a, last: (now + 1) if last is None else last + 2), \
+                        patch.object(E.threading, "Thread", side_effect=track_thread):
+                    try:
+                        eng.start_scheduler()
+                        deadline = started + 30
+                        while time.monotonic() < deadline:
+                            runs = eng.store.list_runs(50)
+                            if len(runs) >= 3 and not eng.running:
+                                completed = True
+                                break
+                            if eng.last_error:
+                                break
+                            time.sleep(0.05)
+                        # Capture the pre-stop state: stop may cancel an unfinished run.
+                        observed = {"elapsed": time.monotonic() - started, "state": eng.status(),
+                                    "last_auto_start": eng._last_auto_start,
+                                    "runs": [{k: r[k] for k in ("id", "started", "finished", "trigger")}
+                                             for r in eng.store.list_runs(50)]}
+                    finally:
+                        eng.stop()
+                        cleanup_deadline = time.monotonic() + 10
+                        for worker in threads:
+                            if worker.ident is not None:
+                                worker.join(max(0, cleanup_deadline - time.monotonic()))
+                alive = [worker.name for worker in threads if worker.is_alive()]
+                detail = json.dumps({**observed, "alive_after_stop": alive}, ensure_ascii=False)
+                self.assertTrue(completed, detail)
+                self.assertFalse(alive, detail)
+                self.assertFalse(eng.running, detail)
+                self.assertEqual(eng.last_error, "", detail)
                 runs = eng.store.list_runs(50)
-                self.assertGreaterEqual(len(runs), 3)
+                self.assertGreaterEqual(len({r["id"] for r in runs}), 3, detail)
                 self.assertTrue(all(r["trigger"] == "auto" for r in runs))
-        finally:
-            E.next_slot = orig
+                expected = {d["id"] for d in eng.cfg.get()["devices"] if d["enabled"]}
+                for run in runs:
+                    self.assertEqual(set(eng.store.get_run(run["id"])["devices"]), expected)
+            finally:
+                if not any(worker.is_alive() for worker in threads):
+                    eng.store._db.close()
 
     def test_stuck_run_does_not_block_next(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
