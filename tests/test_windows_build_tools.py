@@ -24,8 +24,10 @@ class AutostartPaths(unittest.TestCase):
             shutil.copyfile(Path(__file__).resolve().parents[1] / "tools" / script.name, script)
             (folder / "NetcheckCenter.exe").touch()
             result = self.inspect(script)
-            self.assertEqual(Path(result["TargetPath"]), folder / "NetcheckCenter.exe")
-            self.assertEqual(Path(result["WorkingDirectory"]), folder)
+            # PowerShell expands Windows 8.3 aliases (RUNNER~1); compare the
+            # actual files/directories instead of their textual spelling.
+            self.assertTrue(Path(result["TargetPath"]).samefile(folder / "NetcheckCenter.exe"))
+            self.assertTrue(Path(result["WorkingDirectory"]).samefile(folder))
             self.assertEqual(result["Arguments"], "--minimized")
             self.assertEqual(Path(result["LinkPath"]).name, "AutoNetwork NetcheckCenter.lnk")
 
