@@ -22,6 +22,8 @@
     st: null, run: null, latestId: null, viewing: null, trends: {}, events: [], tab: "devices",
     drawer: null, dtab: "checks", rawCmd: null, rawCache: {}, trendHours: 24, trend7: null,
     lastNotified: 0, consoleOut: null, settingsDirty: false, vrrp: null, vrrpFilter: "all",
+    stateRequest: 0, stateApplied: 0, latestRequest: 0, runRequest: 0, runPending: false,
+    trendsRequest: 0, eventsRequest: 0, vrrpRequest: 0, vrrpApplied: 0,
   };
 
   // ------------------------------------------------------------------ 유틸
@@ -102,11 +104,17 @@
 
   // ------------------------------------------------------------------ 데이터 갱신
   async function refreshState(strict = false) {
+    const request = ++S.stateRequest, selection = S.runRequest;
     try {
-      S.st = await api("/api/state");
+      const state = await api("/api/state");
+      // A strict refresh may finish while a newer poll is still pending. Only
+      // a response already applied by a newer request can supersede this one.
+      if (request < S.stateApplied) return;
+      S.stateApplied = request;
+      S.st = state;
       S.clockOffset = S.st.engine.now - Date.now() / 1000;
     } catch (e) {
-      $("#schedText").textContent = "프로그램과 연결이 끊겼습니다";
+      if (request >= S.stateApplied) $("#schedText").textContent = "프로그램과 연결이 끊겼습니다";
       if (strict) throw e;
       return;
     }
@@ -114,9 +122,20 @@
     if (newest && newest !== S.latestId) {
       const first = S.latestId === null;
       S.latestId = newest;
+      S.latestRequest = request;
       await Promise.all([loadTrends(), loadEvents(), loadVrrp()]);
-      if (!S.viewing) await loadRun(null);
+      if (request !== S.latestRequest) return;
+      // A selection made while state/auxiliary requests were pending owns the
+      // screen, including a history request that has not returned yet.
+      if (!S.viewing && !S.runPending) {
+        if (selection === S.runRequest) await loadRun(null);
+        else renderAll();
+      }
+      if (request !== S.latestRequest) return;
       if (!first) notifyNewRun();
+    } else if (newest && !S.viewing && !S.runPending && (!S.run || S.run.id !== newest)) {
+      // latestId records the observed state, not a successful result fetch.
+      if (selection === S.runRequest) await loadRun(null);
     } else if (!S.run && !newest) {
       renderAll();
     }
@@ -125,15 +144,31 @@
   }
 
   async function loadRun(id) {
+    const request = ++S.runRequest;
+    S.runPending = true;
+    let run;
     try {
-      S.run = await api(`/api/run${id ? `?id=${id}` : ""}`);
-    } catch { S.run = null; }
+      run = await api(`/api/run${id ? `?id=${id}` : ""}`);
+    } catch { run = null; }
+    if (request !== S.runRequest) return;
+    S.runPending = false;
+    S.run = run;
     S.viewing = id && id !== S.latestId ? id : null;
     S.rawCache = {};
     renderAll();
   }
-  async function loadTrends() { try { S.trends = await api("/api/trends?hours=48"); } catch { S.trends = {}; } }
-  async function loadEvents() { try { S.events = await api("/api/events?limit=80"); } catch { S.events = []; } }
+  async function loadTrends() {
+    const request = ++S.trendsRequest;
+    let trends;
+    try { trends = await api("/api/trends?hours=48"); } catch { trends = {}; }
+    if (request === S.trendsRequest) S.trends = trends;
+  }
+  async function loadEvents() {
+    const request = ++S.eventsRequest;
+    let events;
+    try { events = await api("/api/events?limit=80"); } catch { events = []; }
+    if (request === S.eventsRequest) S.events = events;
+  }
 
   function notifyNewRun() {
     const fresh = S.events.filter((e) => e.run_id === S.latestId && e.kind === "new" && (e.level === "crit" || e.level === "warn"));
@@ -513,7 +548,12 @@
 
   // ------------------------------------------------------------------ VRRP 변경 이력
   async function loadVrrp() {
-    try { S.vrrp = await api("/api/vrrp"); } catch { S.vrrp = S.vrrp || { items: [], unacked: 0 }; }
+    const request = ++S.vrrpRequest;
+    let vrrp;
+    try { vrrp = await api("/api/vrrp"); } catch { vrrp = S.vrrp || { items: [], unacked: 0 }; }
+    // The initial tab retries while vrrp is null; a newer pending request must
+    // not discard a usable response and keep that retry chain alive.
+    if (request >= S.vrrpApplied) { S.vrrpApplied = request; S.vrrp = vrrp; }
   }
 
   function renderVrrp() {

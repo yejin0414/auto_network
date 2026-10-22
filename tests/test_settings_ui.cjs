@@ -34,7 +34,7 @@ function fixture() {
   const context = vm.createContext({
     S: {st: {config: {devices: [], thresholds: {cpu_warn: 50, cpu_crit: 70}, extra_commands: {}, ssh: {}},
       credentials: {shared: {username: 'synthetic', remembered: true}}, credential_profiles: {shared: '접속 계정'}},
-      devDirty: true, savingSettings: false},
+      devDirty: true, savingSettings: false, stateRequest: 0, stateApplied: 0},
     FormData: class {constructor(f) {this.values = f.values;} get(k) {return this.values[k];}},
     $: (key, parent) => parent ? key === '[data-clear]' ? parent.clear : parent.warning : fields[key],
     $$: key => key === '#tab-settings .cred' ? [form] : key === '.cred [data-clear]' ? [clear] : key.includes('#saveCfg') ? buttons : [],
@@ -180,5 +180,6 @@ function fixture() {
     assert.doesNotMatch(f.fields['#dbBackupNote'].textContent, /저장했습니다/);
     assert.equal(f.fields['#dbBackup'].disabled, false);
   }
+  await require('./test_history_ui.cjs')();
   console.log('PASS: settings UI validation, single transaction, duplicate save, real refresh failure, save/clear rollback recovery, storage warnings, managed backup');
 })().catch(error => {console.error(error); process.exitCode = 1;});
