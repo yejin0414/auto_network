@@ -179,12 +179,14 @@ class App:
                     return 503, {"error": "프로그램을 종료 중이므로 DB를 백업할 수 없습니다."}
                 if body:
                     return 400, {"error": "DB 백업은 지정된 백업 폴더만 사용합니다. 추가 입력 없이 요청하세요."}
-                try:
-                    backup = eng.backup_database()
-                except (sqlite3.Error, OSError):
-                    eng.last_error = STORAGE_WRITE_ERROR
-                    return 503, {"error": "DB 백업을 완료하지 못했습니다. 저장 공간과 파일 권한을 확인하세요. 기존 DB는 유지됩니다."}
-                return 200, {"ok": True, "path": str(backup)}
+            # Admission follows any in-flight settings transaction; the long
+            # copy/validation must not block state polling, saving or shutdown.
+            try:
+                backup = eng.backup_database()
+            except (sqlite3.Error, OSError):
+                eng.last_error = STORAGE_WRITE_ERROR
+                return 503, {"error": "DB 백업을 완료하지 못했습니다. 저장 공간과 파일 권한을 확인하세요. 기존 DB는 유지됩니다."}
+            return 200, {"ok": True, "path": str(backup)}
         if path in ("/api/config", "/api/credentials", "/api/settings"):
             with self._config_lock:
                 if self._closing:

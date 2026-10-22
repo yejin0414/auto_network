@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .store import validate_database
+from .file_publish import publish_new_file
 
 
 def restore_database(source: Path, destination: Path, *, timeout: float = 30.0) -> Path:
@@ -35,9 +36,11 @@ def restore_database(source: Path, destination: Path, *, timeout: float = 30.0) 
     temporary = Path(name)
     src = target = None
     try:
-        src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=remaining())
+        # Backup retries share our deadline; a per-step busy handler must not
+        # reuse the initial timeout after most of that allowance has elapsed.
+        src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=0)
         src.execute("PRAGMA query_only=ON")
-        target = sqlite3.connect(temporary, timeout=remaining())
+        target = sqlite3.connect(temporary, timeout=0)
         src.backup(target, pages=128, progress=lambda *_: remaining(), sleep=0.01)
         target.execute("PRAGMA journal_mode=DELETE").fetchall()
         target.close()
@@ -48,9 +51,11 @@ def restore_database(source: Path, destination: Path, *, timeout: float = 30.0) 
         with temporary.open("r+b") as file:
             os.fsync(file.fileno())
         remaining()
+        if any(os.path.lexists(str(destination) + suffix) for suffix in ("-wal", "-shm", "-journal")):
+            raise FileExistsError("복원 검증 도중 대상 SQLite 보조 파일이 생겼습니다.")
         # Atomic no-overwrite publication also handles a target appearing while
         # the backup was being checked. Windows handles are already closed.
-        os.link(temporary, destination)
+        publish_new_file(temporary, destination)
         return destination.resolve()
     finally:
         if target is not None:

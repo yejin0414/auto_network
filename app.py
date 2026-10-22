@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import mimetypes
 import os
 import sqlite3
@@ -56,28 +57,48 @@ def main() -> int:
     maintenance = ap.add_mutually_exclusive_group()
     maintenance.add_argument("--restore-db", type=Path, help="백업 DB를 검증해 새 파일로 복원(장비 접속 없음)")
     maintenance.add_argument("--verify-db", type=Path, help="DB 무결성과 Netcheck 스키마만 검증(장비 접속 없음)")
+    maintenance.add_argument("--export-backup", type=Path, help="DB를 SHA-256 검증 정보가 포함된 외부 보관 패키지로 내보내기")
+    maintenance.add_argument("--verify-backup", type=Path, help="외부 보관 패키지의 내용·SHA-256·DB 무결성 검증")
+    maintenance.add_argument("--restore-backup", type=Path, help="외부 보관 패키지를 검증해 새 DB로 복원")
     ap.add_argument("--restore-to", type=Path, help="복원할 새 DB 경로(기존 파일 덮어쓰기 금지)")
+    ap.add_argument("--export-to", type=Path, help="내보낼 새 .ncbak 파일 경로(기존 파일 덮어쓰기 금지)")
+    ap.add_argument("--db-timeout", type=float, default=300.0, help="DB 검증·복원·내보내기 전체 제한 시간(초, 기본 300)")
     args = ap.parse_args()
     if sys.stdout is None:  # pythonw / 창 없는 실행
         sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-    if args.restore_to and not args.restore_db:
-        ap.error("--restore-to는 --restore-db와 함께 사용하세요.")
-    if args.restore_db or args.verify_db:
-        if args.restore_db and not args.restore_to:
-            ap.error("--restore-db에는 새 경로 --restore-to가 필요합니다.")
+    restoring = args.restore_db or args.restore_backup
+    if not math.isfinite(args.db_timeout) or args.db_timeout <= 0:
+        ap.error("--db-timeout은 유한한 양수여야 합니다.")
+    if args.restore_to and not restoring:
+        ap.error("--restore-to는 --restore-db 또는 --restore-backup과 함께 사용하세요.")
+    if restoring and not args.restore_to:
+        ap.error("복원에는 새 경로 --restore-to가 필요합니다.")
+    if bool(args.export_to) != bool(args.export_backup):
+        ap.error("--export-backup과 새 경로 --export-to를 함께 사용하세요.")
+    if restoring or args.verify_db or args.export_backup or args.verify_backup:
         # Maintenance exits before config, credentials, driver or scheduler setup.
         from nc.db_maintenance import restore_database
+        from nc.backup_transfer import export_backup, restore_backup, verify_backup_package
         from nc.store import validate_database
         try:
             if args.restore_db:
-                path = restore_database(args.restore_db, args.restore_to)
+                path = restore_database(args.restore_db, args.restore_to, timeout=args.db_timeout)
                 message = f"DB 복원 완료: {path} (기존 DB는 변경하지 않았습니다)"
+            elif args.restore_backup:
+                path = restore_backup(args.restore_backup, args.restore_to, timeout=args.db_timeout)
+                message = f"외부 백업 복원 완료: {path} (기존 DB는 변경하지 않았습니다)"
+            elif args.export_backup:
+                path = export_backup(args.export_backup, args.export_to, timeout=args.db_timeout)
+                message = f"외부 보관 패키지 생성 완료: {path}"
+            elif args.verify_backup:
+                metadata = verify_backup_package(args.verify_backup, timeout=args.db_timeout)
+                message = f"외부 백업 SHA-256 및 DB 무결성 검증 완료: {metadata['sha256']}"
             else:
-                validate_database(args.verify_db)
+                validate_database(args.verify_db, timeout=args.db_timeout)
                 message = "DB 무결성 및 Netcheck 스키마 검증 완료"
         except (OSError, ValueError, sqlite3.Error):
-            message = "DB 검증/복원 실패: 백업 무결성, 새 대상 경로, 디스크 공간·권한·잠금을 확인하세요."
+            message = "DB 백업/검증/복원 실패: 무결성, 새 대상 경로, 디스크 공간·권한·잠금 및 제한 시간을 확인하세요."
             print(message, file=sys.stderr)
             message_box(message)
             return 1

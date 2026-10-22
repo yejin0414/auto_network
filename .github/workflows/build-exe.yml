@@ -56,6 +56,17 @@ jobs:
             exit 1
           }
 
+      - name: 대용량 DB 및 외부 백업 복구 (합성 1GiB)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python tests\db_scale_check.py --runs 10000 --devices 100 --raw-bytes 1536 --min-db-bytes 1073741824 --output db_scale_check.json *> db_scale_check.log
+          $code = $LASTEXITCODE
+          Get-Content db_scale_check.log
+          if ($code -ne 0) { exit $code }
+
       - name: EXE 빌드
         run: >
           python -m PyInstaller --noconfirm --clean --onedir --windowed
@@ -145,6 +156,7 @@ jobs:
           Copy-Item UPSTREAM.md $d\
           New-Item -ItemType Directory -Force "$d\docs" | Out-Null
           Copy-Item docs\MIGRATION_ANALYSIS.md "$d\docs\"
+          Copy-Item docs\DATABASE_VALIDATION.md "$d\docs\"
           Compress-Archive -Force -Path "$d\*" -DestinationPath NetcheckCenter_windows.zip
           $hash = (Get-FileHash -Algorithm SHA256 NetcheckCenter_windows.zip).Hash.ToLowerInvariant()
           "$hash  NetcheckCenter_windows.zip" | Out-File -Encoding ascii NetcheckCenter_windows.zip.sha256
@@ -175,5 +187,7 @@ jobs:
             inst_check.log
             win_check.log
             task_check.log
+            db_scale_check.log
+            db_scale_check.json
           if-no-files-found: warn
           retention-days: 14

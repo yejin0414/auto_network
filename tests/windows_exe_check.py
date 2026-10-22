@@ -7,6 +7,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.mock_ssh import MockDevice  # noqa: E402
 from tests.test_e2e_ssh import aruba, comware  # noqa: E402
 from nc.store import validate_database, _wal_safe_version  # noqa: E402
+from nc.backup_transfer import verify_backup_package  # noqa: E402
 
 EXE = Path(sys.argv[1]).resolve()
 PORT = 8799
@@ -139,6 +141,38 @@ def verify_database_backup_and_cleanup(token, config, run):
                                   cwd=EXE.parent, env=env, timeout=45)
         assert rejected.returncode == 1, "기존 DB 덮어쓰기를 거부하지 않음"
         assert hashlib.sha256(restored.read_bytes()).hexdigest() == before
+        # All paths are disposable runner files. Simulate transport, then make
+        # the exporting copy unavailable before restoring through the EXE.
+        offline = Path(directory) / "offline-source.sqlite3"
+        shutil.copyfile(backup, offline)
+        package = Path(directory) / "export.ncbak"
+        completed = subprocess.run([str(EXE), "--export-backup", str(offline), "--export-to", str(package),
+                                    "--db-timeout", "60"], cwd=EXE.parent, env=env, timeout=75)
+        assert completed.returncode == 0, "EXE 외부 백업 내보내기 실패"
+        external = Path(directory) / "isolated-external" / "received.ncbak"
+        external.parent.mkdir()
+        shutil.copyfile(package, external)
+        assert hashlib.sha256(package.read_bytes()).digest() == hashlib.sha256(external.read_bytes()).digest()
+        offline.unlink()
+        package.unlink()
+        metadata = verify_backup_package(external)
+        recovered = Path(directory) / "new-install" / "recovered.sqlite3"
+        for arguments in (["--verify-backup", str(external)],
+                          ["--restore-backup", str(external), "--restore-to", str(recovered)]):
+            completed = subprocess.run([str(EXE), *arguments], cwd=EXE.parent, env=env, timeout=75)
+            assert completed.returncode == 0, "EXE 외부 백업 검증/복구 실패"
+        assert hashlib.sha256(recovered.read_bytes()).hexdigest() == metadata["sha256"]
+        rejected = subprocess.run([str(EXE), "--restore-backup", str(external), "--restore-to", str(recovered)],
+                                  cwd=EXE.parent, env=env, timeout=75)
+        assert rejected.returncode == 1
+        assert hashlib.sha256(recovered.read_bytes()).hexdigest() == metadata["sha256"]
+        invalid = external.with_name("truncated.ncbak")
+        invalid.write_bytes(external.read_bytes()[:100])
+        refused = recovered.with_name("must-not-exist.sqlite3")
+        rejected = subprocess.run([str(EXE), "--restore-backup", str(invalid), "--restore-to", str(refused)],
+                                  cwd=EXE.parent, env=env, timeout=75)
+        assert rejected.returncode == 1 and not refused.exists()
+        print("Windows EXE 외부 백업 전송·원본 없이 복원·SHA-256·손상/덮어쓰기 거부 확인")
     assert hashlib.sha256(backup.read_bytes()).hexdigest() == digest
     removed = json.loads(json.dumps(config))
     removed["devices"] = [d for d in removed["devices"] if d["id"] != "bb3"]
