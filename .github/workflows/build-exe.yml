@@ -1,0 +1,171 @@
+name: Windows 검증 및 EXE artifact
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      NC_WINDOWS_TESTS_DISPOSABLE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 공개 소스 스냅샷 점검
+        run: python tools/check_snapshot.py
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 테스트 (파서 + 가짜 SSH 장비 종단 테스트)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python -m unittest discover -s tests -t . -v *> test.log
+          $code = $LASTEXITCODE
+          Get-Content test.log
+          if ($code -ne 0) {
+            $lines = Get-Content test.log
+            $lines | Select-String -Pattern "\.\.\. (FAIL|ERROR)$" | ForEach-Object { Write-Output "::error::$($_.Line)" }
+            $start = ($lines | Select-String -Pattern "^={20,}" | Select-Object -First 1).LineNumber
+            if ($start) { $lines[($start - 1)..([Math]::Min($lines.Count - 1, $start + 70))] | Where-Object { $_.Trim() } | ForEach-Object { Write-Output "::error::$_" } }
+            exit 1
+          }
+
+      - name: EXE 빌드
+        run: >
+          python -m PyInstaller --noconfirm --clean --onedir --windowed
+          --name NetcheckCenter --icon web\icon.ico
+          --add-data "web;web" --add-data "config\config.example.json;config"
+          --hidden-import keyring.backends.Windows
+          --collect-submodules netmiko
+          app.py
+
+      - name: 실행 확인 (데모 1회 점검)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\NetcheckCenter\NetcheckCenter.exe -ArgumentList "--demo","--check-once" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "EXE 실행 실패: $($p.ExitCode)" }
+          if (-not (Test-Path dist\NetcheckCenter\data-demo\netcheck.sqlite3)) { throw "점검 결과가 저장되지 않았습니다" }
+          Remove-Item -Recurse -Force dist\NetcheckCenter\data-demo
+
+      - name: 실행 확인 (계정 저장 → SSH 점검 → 재시작 후 계정 유지)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python tests\windows_exe_check.py dist\NetcheckCenter\NetcheckCenter.exe *> exe_check.log
+          $code = $LASTEXITCODE
+          Get-Content exe_check.log
+          if ($code -ne 0) {
+            Get-Content exe_check.log | Select-Object -Last 40 | Out-String | ForEach-Object { Write-Output ("::error::" + ($_ -replace "%","%25" -replace "`r","" -replace "`n","%0A")) }
+            exit 1
+          }
+
+      - name: 실행 확인 (중복 실행 방지, 이전 버전 자동 교체, 포트 독점)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python tests\windows_instance_check.py dist\NetcheckCenter\NetcheckCenter.exe *> inst_check.log
+          $code = $LASTEXITCODE
+          Get-Content inst_check.log
+          Remove-Item -Recurse -Force dist\NetcheckCenter\data-demo -ErrorAction SilentlyContinue
+          if ($code -ne 0) {
+            Get-Content inst_check.log | Select-Object -Last 40 | Out-String | ForEach-Object { Write-Output ("::error::" + ($_ -replace "%","%25" -replace "`r","" -replace "`n","%0A")) }
+            exit 1
+          }
+
+      - name: 실행 확인 (프로그램 창 열기, 창 닫으면 완전 종료, 엑셀 저장, 알림)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python tests\windows_window_check.py dist\NetcheckCenter\NetcheckCenter.exe *> win_check.log
+          $code = $LASTEXITCODE
+          Get-Content win_check.log
+          Remove-Item -Recurse -Force dist\NetcheckCenter\data-demo, dist\NetcheckCenter\보고서-demo -ErrorAction SilentlyContinue
+          if ($code -ne 0) {
+            Get-Content win_check.log | Select-Object -Last 40 | Out-String | ForEach-Object { Write-Output ("::error::" + ($_ -replace "%","%25" -replace "`r","" -replace "`n","%0A")) }
+            exit 1
+          }
+
+      - name: 실행 확인 (창을 닫아도 자동 점검 - 작업 스케줄러)
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          python tests\windows_task_check.py dist\NetcheckCenter\NetcheckCenter.exe *> task_check.log
+          $code = $LASTEXITCODE
+          Get-Content task_check.log
+          if ($code -ne 0) {
+            Get-Content task_check.log | Select-Object -Last 40 | Out-String | ForEach-Object { Write-Output ("::error::" + ($_ -replace "%","%25" -replace "`r","" -replace "`n","%0A")) }
+            exit 1
+          }
+
+      - name: 배포 파일 묶기
+        shell: pwsh
+        run: |
+          $d = "dist\NetcheckCenter"
+          # 검사 중 생긴 파일은 배포본에서 제외
+          Remove-Item -Recurse -Force "$d\data", "$d\data-demo", "$d\보고서", "$d\보고서-demo", "$d\config\config.json" -ErrorAction SilentlyContinue
+          Set-Content -Encoding ascii "$d\데모_실행.bat" "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" NetcheckCenter.exe --demo"
+          Set-Content -Encoding ascii "$d\웹_버전_실행.bat" "@echo off`r`ncd /d `"%~dp0`"`r`nstart `"`" NetcheckCenter.exe --web"
+          Copy-Item tools\install_autostart.ps1 $d\
+          Copy-Item README.md $d\
+          Get-ChildItem -Path . -File | Where-Object { $_.Name -like "NOTICE*" -or $_.Name -like "LICENSE*" } | Copy-Item -Destination $d
+          Copy-Item UPSTREAM.md $d\
+          New-Item -ItemType Directory -Force "$d\docs" | Out-Null
+          Copy-Item docs\MIGRATION_ANALYSIS.md "$d\docs\"
+          Compress-Archive -Force -Path "$d\*" -DestinationPath NetcheckCenter_windows.zip
+          $hash = (Get-FileHash -Algorithm SHA256 NetcheckCenter_windows.zip).Hash.ToLowerInvariant()
+          "$hash  NetcheckCenter_windows.zip" | Out-File -Encoding ascii NetcheckCenter_windows.zip.sha256
+          Expand-Archive NetcheckCenter_windows.zip -DestinationPath verified-package
+          if (-not (Test-Path verified-package\NetcheckCenter.exe)) { throw "ZIP에 EXE가 없습니다" }
+          if (-not (Test-Path verified-package\_internal\config\config.example.json)) { throw "ZIP에 예제 설정이 없습니다" }
+          foreach ($unwanted in @("data", "data-demo", "보고서", "보고서-demo", "config\config.json")) {
+            if (Test-Path (Join-Path verified-package $unwanted)) { throw "ZIP에 운영 데이터 포함: $unwanted" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetcheckCenter_windows
+          path: |
+            NetcheckCenter_windows.zip
+            NetcheckCenter_windows.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 검증 로그 보관
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-validation-logs
+          path: |
+            test.log
+            exe_check.log
+            inst_check.log
+            win_check.log
+            task_check.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,12 @@
+(MM-01) [mynode] #show switches
+
+All Switches
+------------
+IP Address      IPv6 Address  Name        Location   Type     Model        Version            Status  Configuration State  Config Sync Time (sec)  Config ID
+----------      ------------  ----        --------   ----     -----        -------            ------  -------------------  ----------------------  ---------
+192.0.2.10      None          MM-01       Building1  master   ArubaMM-VA   8.10.0.7_88523     up      UPDATE SUCCESSFUL    0                       215
+192.0.2.11      None          WLC-01      Building1  MD       Aruba7240XM  8.10.0.7_88523     up      UPDATE SUCCESSFUL    0                       215
+192.0.2.12      None          WLC-02      Building1  MD       Aruba7240XM  8.10.0.7_88523     down    UPDATE REQUIRED      0                       210
+
+Total Switches:3
+(MM-01) [mynode] #

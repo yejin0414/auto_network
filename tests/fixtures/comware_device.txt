@@ -1,0 +1,4 @@
+<BB-3>display device
+Slot Type             State    Subslot  Soft Ver             Patch Ver
+1    S6800-54QF       Master   0        S6800-2609           None
+2    S6800-54QF       Standby  0        S6800-2609           None

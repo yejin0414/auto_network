@@ -1,0 +1,5 @@
+netmiko>=4.3.0,<5
+paramiko>=3.4.0,<4  # 최신 paramiko(5.x)는 오래된 Comware 백본의 SHA-1 SSH 방식을 지원하지 않음
+PyYAML>=6.0
+openpyxl>=3.1
+keyring>=24.0 ; sys_platform == "win32"

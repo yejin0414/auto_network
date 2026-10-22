@@ -1,0 +1,9 @@
+(WLC-01) # show lc-cluster group-membership
+
+IP Address       Connection-Type
+----------       ---------------
+192.0.2.11       Type-A
+192.0.2.12       Type-A
+192.0.2.13       Type-A
+192.0.2.14       Type-A
+(WLC-01) #

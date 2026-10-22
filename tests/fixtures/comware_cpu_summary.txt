@@ -1,0 +1,4 @@
+<BB-3>show cpu summary
+Slot CPU        Last 5 sec        Last 1 min        Last 5 min
+1    0          6%                7%                6%
+2    0          12%               11%               9%

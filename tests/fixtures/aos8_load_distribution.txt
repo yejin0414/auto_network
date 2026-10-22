@@ -1,0 +1,8 @@
+Cluster Load Distribution for Clients
+-------------------------------------
+Type IPv4 Address    Active Clients Standby Clients
+---- --------------- -------------- ---------------
+self 192.0.2.11                 412             398
+peer 192.0.2.12                 389             420
+peer 192.0.2.13                  12             401
+Total: Active Clients 813 Standby Clients 1219

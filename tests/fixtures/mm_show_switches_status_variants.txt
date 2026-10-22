@@ -1,0 +1,6 @@
+IPv4 Address     Name              Status
+------------     ----              ------
+192.0.2.11       WLC-01            up
+192.0.2.12       WLC-02            Up
+192.0.2.13       WLC-03            UP
+192.0.2.14       WLC-04            dOwN

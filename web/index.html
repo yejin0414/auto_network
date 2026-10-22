@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoNetwork · 무선망 통합 점검</title>
+<link rel="stylesheet" href="/static/app.css">
+<script>window.NC_TOKEN = "__NC_TOKEN__"; window.NC_DESKTOP = __NC_DESKTOP__;</script>
+<link rel="icon" href="/static/icon.png">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="22" r="3"/><path d="M8.5 15.5a10.6 10.6 0 0 1 15 0M4.5 11a16.3 16.3 0 0 1 23 0" fill="none" stroke-width="2.6" stroke-linecap="round"/></svg>
+    <div>
+      <div class="brand-title"><span id="siteName">무선망 통합 점검</span><span id="demoTag" class="demo-tag" hidden>데모</span><span id="appVer" class="ver"></span></div>
+      <div class="brand-sub">백본, Mobility Master, WLC 클러스터 통합 자동 점검</div>
+    </div>
+  </div>
+  <div class="bar-right">
+    <div class="sched" id="schedBox" title="자동 점검 일정">
+      <span class="sched-dot" id="schedDot"></span>
+      <span id="schedText">자동 점검 확인 중</span>
+    </div>
+    <button class="icon-btn" id="themeBtn" title="화면 밝기 전환" aria-label="화면 밝기 전환">
+      <svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
+    </button>
+    <button class="btn" id="excelBtn" title="가장 최근 점검 결과를 엑셀로 만들어 엽니다">
+      <svg class="xl" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 8l8 8M16 8l-8 8"/></svg>엑셀 보고서</button>
+    <button class="btn" id="quitBtn" hidden title="웹 버전은 브라우저를 닫아도 계속 실행됩니다. 완전히 끄려면 누르세요.">프로그램 끄기</button>
+    <button class="btn primary" id="runBtn"><span class="spin" aria-hidden="true"></span><span id="runLabel">지금 점검</span></button>
+  </div>
+</header>
+
+<main>
+  <div class="cred-banner" id="credBanner" role="alert" hidden>
+    <div><b id="credBannerTitle">접속 계정이 필요합니다</b><span id="credBannerText"></span></div>
+    <button class="btn primary small" id="credBannerBtn">계정 입력하기</button>
+  </div>
+
+  <section class="hero" aria-label="종합 상태">
+    <div class="verdict" id="verdict">
+      <div class="verdict-state" id="verdictState">불러오는 중</div>
+      <p class="verdict-line" id="verdictLine"></p>
+      <dl class="verdict-stats" id="verdictStats"></dl>
+      <ul class="verdict-recent" id="verdictRecent" aria-label="최근 상태 변화"></ul>
+      <div class="verdict-meta" id="verdictMeta"></div>
+    </div>
+    <div class="topo" id="topo" aria-label="장비 구성도"></div>
+  </section>
+
+  <div class="history-banner" id="historyBanner" hidden>
+    <span id="historyText"></span>
+    <button class="btn ghost small" id="backLatest">최신 결과로 돌아가기</button>
+  </div>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="devices" aria-selected="true">장비 현황</button>
+    <button role="tab" data-tab="cluster">WLC 클러스터</button>
+    <button role="tab" data-tab="vrrp">VRRP 이력</button>
+    <button role="tab" data-tab="history">이력</button>
+    <button role="tab" data-tab="console">직접 확인</button>
+    <button role="tab" data-tab="settings">설정</button>
+  </nav>
+
+  <section class="panel" id="tab-devices"></section>
+  <section class="panel" id="tab-cluster" hidden></section>
+  <section class="panel" id="tab-vrrp" hidden></section>
+  <section class="panel" id="tab-history" hidden></section>
+  <section class="panel" id="tab-console" hidden></section>
+  <section class="panel" id="tab-settings" hidden></section>
+</main>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-scrim" data-close></div>
+  <div class="drawer-body" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+    <div class="drawer-head">
+      <div>
+        <div class="drawer-title" id="drawerTitle"></div>
+        <div class="drawer-sub" id="drawerSub"></div>
+      </div>
+      <button class="icon-btn" data-close aria-label="닫기"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+    <div class="drawer-tabs" role="tablist">
+      <button data-dtab="checks" aria-selected="true">점검 항목</button>
+      <button data-dtab="raw">원본 출력</button>
+      <button data-dtab="trend">추이</button>
+      <button data-dtab="diag">접속 진단</button>
+    </div>
+    <div class="drawer-content" id="drawerContent"></div>
+  </div>
+</aside>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

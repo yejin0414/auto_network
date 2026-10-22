@@ -1,0 +1,13 @@
+<BB-3>display memory
+Memory statistics are measured in KB:
+Slot 1:
+             Total      Used      Free    Shared   Buffers    Cached   FreeRatio
+Mem:       1001004    543284    457720         0      2196    136228       45.7%
+-/+ Buffers/Cache:    404860    596144
+Swap:            0         0         0
+
+Slot 2:
+             Total      Used      Free    Shared   Buffers    Cached   FreeRatio
+Mem:       1001004    643284    357720         0      2196    136228       35.7%
+-/+ Buffers/Cache:    404860    596144
+Swap:            0         0         0

@@ -1,0 +1,12 @@
+<BB-3>display link-aggregation summary
+Aggregation Interface Type:
+BAGG -- Bridge-Aggregation, BLAGG -- Blade-Aggregation, RAGG -- Route-Aggregation
+Aggregation Mode: S -- Static, D -- Dynamic
+Loadsharing Type: Shar -- Loadsharing, NonS -- Non-Loadsharing
+Actor System ID: 0x8000, 0cda-41b5-cf00
+
+AGG        AGG   Partner ID              Selected  Unselected  Individual  Share
+Interface  Mode                          Ports     Ports       Ports       Type
+--------------------------------------------------------------------------------
+BAGG10     D     0x8000, 0cda-41b5-d100  2         0           0           Shar
+BAGG20     D     0x8000, 0cda-41b5-e200  1         1           0           Shar

@@ -1,0 +1,7 @@
+Aruba Operating System Software.
+ArubaOS (MODEL: Aruba7240XM), Version 8.10.0.7
+Website: http://www.arubanetworks.com
+Compiled on 2023-09-05 at 11:51:01 UTC (build 88523) by p4build
+ROM: System Bootstrap, Version CPBoot 1.2.1.0 (build 76015)
+Switch uptime is 25 days 3 hours 31 minutes 16 seconds
+Reboot Cause: User reboot (Intent:cause:register 78:86:0:2c)

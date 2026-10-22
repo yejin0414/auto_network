@@ -1,0 +1,235 @@
+"""무선망 통합 점검 센터 — 실행 진입점.
+
+    python app.py              프로그램 창으로 실행 (실장비, config/config.json)
+    python app.py --demo       장비 없이 데모 데이터로 실행
+    python app.py --browser    프로그램 창(Edge 앱 모드) 대신 기본 웹 브라우저로 열기
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import mimetypes
+import os
+import sys
+import threading
+import time
+import webbrowser
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+from nc.collector import NetmikoDriver
+from nc.config import CREDENTIAL_PROFILES, ConfigStore
+from nc.credentials import Credential, CredentialStore
+from nc.engine import Engine
+from nc.server import App, serve
+from nc.store import Store
+
+VERSION = "1.5.1"
+# 자동 검사(CI)에서 '이전 버전' 역할을 흉내 낼 때만 사용
+if __import__("os").environ.get("NC_VERSION_OVERRIDE"):
+    VERSION = __import__("os").environ["NC_VERSION_OVERRIDE"]
+
+
+def base_dirs() -> tuple[Path, Path]:
+    """(리소스 폴더, 실행 폴더). PyInstaller EXE에서도 동작."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)), Path(sys.executable).parent
+    here = Path(__file__).resolve().parent
+    return here, here
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="BB · MM · WLC 통합 자동 점검")
+    ap.add_argument("--demo", action="store_true", help="장비 없이 데모 데이터로 실행")
+    ap.add_argument("--port", type=int, default=0, help="내부 화면 포트(기본 8875, 데모 8876)")
+    ap.add_argument("--browser", action="store_true", help="프로그램 창 대신 기본 웹 브라우저로 열기")
+    ap.add_argument("--web", action="store_true",
+                    help="웹 버전: 평소 쓰는 웹 브라우저로 열고, 브라우저를 닫아도 계속 실행(화면의 ‘프로그램 끄기’로 종료)")
+    ap.add_argument("--minimized", action="store_true", help="창을 최소화한 상태로 시작(자동 시작용)")
+    ap.add_argument("--no-browser", action="store_true", help="창을 열지 않고 화면 서버만 실행(테스트·원격용)")
+    ap.add_argument("--check-once", action="store_true", help="한 번 점검하고 결과만 출력한 뒤 종료")
+    ap.add_argument("--auto-check", action="store_true",
+                    help="(Windows 작업 스케줄러용) 창 없이 1회 점검 → 엑셀 저장 → 알림. 프로그램 창이 켜져 있으면 그쪽이 점검하므로 바로 종료")
+    args = ap.parse_args()
+    if sys.stdout is None:  # pythonw / 창 없는 실행
+        sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+    res_dir, run_dir = base_dirs()
+    data_dir = run_dir / ("data-demo" if args.demo else "data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(data_dir / "netcheck.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()],
+                        format="%(asctime)s %(levelname)s %(message)s")
+    mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("text/css", ".css")
+
+    creds = CredentialStore(persistent=not args.demo)
+    if args.demo:
+        from nc.demo import DEMO_CONFIG, DemoWorld, seed_history
+
+        cfg_path = data_dir / "config.json"
+        if not cfg_path.exists():
+            cfg_path.write_text(json.dumps(DEMO_CONFIG, ensure_ascii=False, indent=2), encoding="utf-8")
+        cfg = ConfigStore(cfg_path)
+        for p in CREDENTIAL_PROFILES:
+            creds.set(p, Credential("demo", "demo"), remember=False)
+        driver = DemoWorld(speed=1.0)
+        driver.devices_provider = lambda: cfg.get()["devices"]
+    else:
+        cfg_dir = run_dir / "config"
+        cfg_dir.mkdir(exist_ok=True)
+        example = res_dir / "config" / "config.example.json"
+        if not (cfg_dir / "config.example.json").exists() and example.exists():
+            (cfg_dir / "config.example.json").write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+        cfg = ConfigStore(cfg_dir / "config.json")
+        creds.load_saved(list(CREDENTIAL_PROFILES))
+        driver = NetmikoDriver()
+
+    store = Store(data_dir / "netcheck.sqlite3")
+    engine = Engine(cfg, store, creds, driver, demo=args.demo)
+    engine.reports_dir = run_dir / ("보고서-demo" if args.demo else "보고서")
+
+    if args.demo and not store.list_runs(1):
+        logging.info("데모 이력(지난 24시간)을 만드는 중…")
+        seed_history(engine, driver)
+
+    if args.auto_check:
+        from nc.instance import running_instance
+
+        sched = cfg.get()["schedule"]
+        if not sched["enabled"] or not sched["background"]:
+            logging.info("[작업 스케줄러] 자동 점검이 꺼져 있어 점검하지 않습니다")
+            return 0
+        if not [d for d in cfg.get()["devices"] if d.get("enabled", True)]:
+            logging.info("[작업 스케줄러] 점검할 장비가 없어 점검하지 않습니다")
+            return 0
+        other = running_instance(demo=args.demo)
+        if other:
+            logging.info("[작업 스케줄러] 프로그램 창(v%s)이 켜져 있어 그쪽 자동 점검에 맡깁니다", other.get("version", "?"))
+            return 0
+        logging.info("[작업 스케줄러] 창이 닫혀 있어 백그라운드로 점검합니다")
+        rid = engine.run_blocking("auto")
+        logging.info("[작업 스케줄러] 점검 %s (%s)", "완료" if rid else "실패", engine.last_report or engine.last_error)
+        logging.shutdown()
+        return 0 if rid else 1
+
+    if args.check_once:
+        rid = engine.run_blocking("manual")
+        run = store.get_run(rid) if rid else None
+        print(json.dumps(run["summary"], ensure_ascii=False, indent=2) if run else "점검 실패")
+        return 0 if rid else 1
+
+    conf = cfg.get()
+    host = "127.0.0.1"
+    port = args.port or (int(conf["server"].get("port", 8875)) + (1 if args.demo else 0))
+    from nc.appwindow import WindowWatch, bring_to_front, find_browser, kill_tree, launch, minimize_when_shown
+
+    app = App(engine, res_dir / "web", desktop=False, version=VERSION)
+    app.web_mode = bool(args.web)
+    from nc.instance import clear_instance, take_over, write_instance
+
+    try:
+        httpd = serve(app, host, port)
+    except OSError:
+        result = take_over(port, VERSION, ask=ask_yes_no, say=lambda m: (print("[알림] " + m), message_box(m)), demo=args.demo)
+        if result != "ready":
+            return 0 if result == "focused" else 2
+        httpd = serve(app, host, port)
+    write_instance(port, app.token, VERSION, demo=args.demo)
+    engine.start_scheduler()
+
+    # 창을 닫아도 자동 점검: Windows 작업 스케줄러 등록/갱신(설정 저장 때마다 다시 맞춤)
+    def sync_background(conf_now: dict) -> None:
+        if args.demo:
+            return
+        from nc import wintask
+
+        def run() -> None:
+            app.background = wintask.sync(conf_now["schedule"])
+        threading.Thread(target=run, name="netcheck-wintask", daemon=True).start()
+
+    app.on_config_saved = sync_background
+    sync_background(conf)
+    url = f"http://{host}:{port}/"
+    logging.info("무선망 통합 점검 센터 v%s%s 시작 (%s)", VERSION, " 데모" if args.demo else "", url)
+    threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.5}, name="netcheck-http", daemon=True).start()
+
+    exit_evt = threading.Event()
+    app.on_quit = exit_evt.set
+    proc = None
+    watch = None
+    if args.web:
+        # 웹 버전: 브라우저 탭을 닫아도 계속 실행하며 자동 점검. 다시 실행하면 브라우저만 새로 엶.
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        logging.info("웹 버전으로 실행합니다 (%s). 끄려면 화면의 ‘프로그램 끄기’", url)
+    elif not args.no_browser:
+        browser = None if args.browser else find_browser()
+        if browser:
+            # 프로그램 창(Edge 앱 모드): 설치 필요 없음, 창을 닫으면 프로그램 전체 종료
+            proc = launch(browser, url, data_dir / "window")
+            if args.minimized:
+                minimize_when_shown()
+            logging.info("프로그램 창을 열었습니다 (%s)", Path(browser).name)
+        else:
+            if not args.browser:
+                message_box("이 PC에서 Microsoft Edge를 찾지 못해 기본 웹 브라우저로 엽니다.")
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        watch = WindowWatch(proc, exit_evt.set)
+        app.watch = watch
+        watch.start()
+    app.on_focus = (lambda: webbrowser.open(url)) if args.web else (lambda: bring_to_front() or (proc is None and webbrowser.open(url)))
+
+    print(f"무선망 통합 점검 센터 v{VERSION}{' (데모)' if args.demo else ''}")
+    print(f"화면 주소: {url}")
+    print("창을 닫거나 이 창에서 Ctrl+C 를 누르면 종료합니다.")
+    try:
+        while not exit_evt.wait(1):
+            pass
+    except KeyboardInterrupt:
+        pass
+    # 정리 후 프로세스를 확실히 끝냄(점검 중인 작업이 있어도 남지 않도록)
+    logging.info("종료합니다")
+    try:
+        if watch:
+            watch.stop()
+        engine.stop()
+        httpd.shutdown()
+        httpd.server_close()
+        kill_tree(proc)
+        clear_instance(demo=args.demo)
+        logging.shutdown()
+    finally:
+        os._exit(0)
+
+
+def ask_yes_no(text: str) -> bool:
+    """Windows 예/아니요 질문. 콘솔에서 실행 중이면(Windows 외) 그대로 진행."""
+    import os
+
+    if os.environ.get("NC_ASSUME_YES") or sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        return ctypes.windll.user32.MessageBoxW(None, text, "무선망 통합 점검", 0x04 | 0x20) == 6
+    except Exception:
+        return True
+
+
+def message_box(text: str) -> None:
+    """콘솔 없는 EXE에서도 보이도록 Windows 메시지 상자를 띄웁니다."""
+    import os
+
+    if sys.platform != "win32" or os.environ.get("NC_NO_DIALOG"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, text, "무선망 통합 점검", 0x40)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    sys.exit(main())

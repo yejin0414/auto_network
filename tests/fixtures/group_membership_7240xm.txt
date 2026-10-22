@@ -1,0 +1,11 @@
+(WLC-01) # show lc-cluster group-membership
+
+Cluster Info Table
+------------------
+Type IPv4 Address    Priority Connection-Type STATUS
+---- --------------- -------- --------------- ------
+self 192.0.2.11           128             N/A CONNECTED (Leader)
+peer 192.0.2.12           128    L2-Connected CONNECTED (Member, last HBT_RSP 44ms ago, RTD = 0.000 ms)
+peer 192.0.2.13           128    L2-Connected CONNECTED (Member, last HBT_RSP 82ms ago, RTD = 0.396 ms)
+peer 192.0.2.14           128    L2-Connected CONNECTED (Member, last HBT_RSP 50ms ago, RTD = 0.100 ms)
+(WLC-01) #

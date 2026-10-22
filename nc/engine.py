@@ -1,0 +1,433 @@
+"""점검 실행·자동 주기 스케줄러."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .collector import CmdResult, DeviceCollection, collect_device, run_spec
+from .commands import CLUSTER_COMMANDS, check_console_command, commands_for
+from .config import ConfigStore, ssh_for
+from .credentials import CredentialStore
+from .evaluate import evaluate_run
+from .store import Store
+
+log = logging.getLogger("netcheck")
+
+
+def next_slot(now: float, interval_min: int, align: bool, last_start: float | None) -> float:
+    if align:
+        dt = datetime.fromtimestamp(now)
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        elapsed = (dt - midnight).total_seconds()
+        step = interval_min * 60
+        k = int(elapsed // step) + 1
+        return (midnight + timedelta(seconds=k * step)).timestamp()
+    if last_start is None:
+        return now + 5
+    return last_start + interval_min * 60
+
+
+def device_time_limit(device: dict, ssh: dict) -> float:
+    """장비 한 대 점검 제한 시간(초). 접속 대기×(재시도+1) + 명령 대기×3, 최소 5분.
+    ssh.device_limit_minutes 를 넣으면 그 값을 씁니다."""
+    s = ssh_for(device, ssh)
+    fixed = float(ssh.get("device_limit_minutes") or 0)
+    if fixed > 0:
+        return fixed * 60
+    return max(300.0, s["connect_timeout"] * (int(s.get("retries", 1)) + 1) + s["command_timeout"] * 3)
+
+
+def _abort_session(holder: dict) -> None:
+    sess = holder.get("session")
+    if sess is None:
+        return
+    fn = getattr(sess, "abort", None) or getattr(sess, "close", None)
+    if fn:
+        threading.Thread(target=fn, name="netcheck-abort", daemon=True).start()
+
+
+class _Abandoned(Exception):
+    """중단 처리된(너무 오래 걸린) 점검이 뒤늦게 끝남"""
+
+
+class Engine:
+    def __init__(self, cfg: ConfigStore, store: Store, creds: CredentialStore, driver: Any, demo: bool = False) -> None:
+        self.cfg = cfg
+        self.store = store
+        self.creds = creds
+        self.driver = driver
+        self.demo = demo
+        self._lock = threading.Lock()
+        self.running = False
+        self.progress: dict[str, str] = {}
+        self.run_started: float | None = None
+        self.run_trigger = ""
+        self.last_error = ""
+        self.next_run: float | None = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._last_auto_start: float | None = None
+        self.schedule_paused_reason = ""
+        self._gen = 0                 # 점검 회차 번호(멈춘 점검을 버릴 때 사용)
+        self.max_run_seconds = 40 * 60  # 이보다 오래 걸리는 점검은 멈춘 것으로 보고 다음 점검을 막지 않음
+        self.device_grace = 45.0        # 장비 제한 시간 뒤 이만큼 더 기다렸다가 강제 중단
+
+    # ------------------------------------------------------------- 상태
+    def status(self) -> dict[str, Any]:
+        return {
+            "running": self.running,
+            "run_started": self.run_started,
+            "run_trigger": self.run_trigger,
+            "progress": dict(self.progress),
+            "next_run": self.next_run,
+            "last_error": self.last_error,
+            "demo": self.demo,
+            "now": time.time(),
+        }
+
+    # ------------------------------------------------------------- 점검
+    def start_check(self, trigger: str = "manual") -> bool:
+        with self._lock:
+            if self.running:
+                return False
+            self.running = True
+            self.run_started = time.time()
+            self.run_trigger = trigger
+            self.progress = {}
+            self._gen += 1
+            gen = self._gen
+        threading.Thread(target=self._run_safe, args=(trigger, None, gen), name="netcheck-run", daemon=True).start()
+        return True
+
+    def run_blocking(self, trigger: str = "manual", now: float | None = None) -> int | None:
+        with self._lock:
+            if self.running:
+                return None
+            self.running = True
+            self.run_started = now or time.time()
+            self.run_trigger = trigger
+            self.progress = {}
+            self._gen += 1
+            gen = self._gen
+        return self._run_safe(trigger, now, gen)
+
+    def _run_safe(self, trigger: str, now: float | None = None, gen: int = 0) -> int | None:
+        try:
+            return self._run(trigger, now, gen)
+        except _Abandoned:
+            log.warning("너무 오래 걸려 중단 처리한 점검이 뒤늦게 끝났습니다(결과는 버림)")
+            return None
+        except Exception as exc:  # pragma: no cover - 방어
+            log.exception("점검 실패")
+            if gen == self._gen:
+                self.last_error = f"점검 중 오류: {type(exc).__name__}: {exc}"
+            return None
+        finally:
+            with self._lock:
+                if gen == self._gen:
+                    self.running = False
+            self._wake.set()
+
+    def abandon_stuck_run(self) -> bool:
+        """점검이 max_run_seconds 넘게 끝나지 않으면 멈춘 것으로 보고 다음 점검을 할 수 있게 합니다."""
+        with self._lock:
+            if not self.running or self.run_started is None:
+                return False
+            if time.time() - self.run_started < self.max_run_seconds:
+                return False
+            mins = int((time.time() - self.run_started) // 60)
+            self._gen += 1
+            self.running = False
+        self.last_error = f"이전 점검이 {mins}분 넘게 끝나지 않아 중단 처리했습니다. 응답 없는 장비가 있는지 확인하세요."
+        log.warning(self.last_error)
+        return True
+
+    def _run(self, trigger: str, now: float | None, gen: int = 0) -> int:
+        cfg = self.cfg.get()
+        started = now or time.time()
+        hook = getattr(self.driver, "begin_run", None)
+        if hook:
+            hook(started)
+        ssh = cfg["ssh"]
+        devices = [d for d in cfg["devices"] if d["enabled"]]
+        wlcs = [d for d in devices if d["role"] == "WLC"]
+        # 클러스터(IN/OUT 등)별 대표 WLC
+        groups: dict[str, list[dict]] = {}
+        for w in wlcs:
+            groups.setdefault(w.get("cluster", ""), []).append(w)
+        primaries = {name: next((w for w in ws if w.get("cluster_primary")), ws[0]) for name, ws in groups.items()}
+        primary_ids = {p["id"] for p in primaries.values()}
+        self.progress = {d["id"]: "대기" for d in devices}
+        limits = {d["id"]: device_time_limit(d, ssh) for d in devices}
+        started_at: dict[str, float] = {}
+        holders: dict[str, dict] = {d["id"]: {} for d in devices}
+
+        def job(d: dict) -> DeviceCollection:
+            started_at[d["id"]] = time.time()
+            specs = commands_for(d["role"], cfg["extra_commands"].get(d["role"]))
+            if d["id"] in primary_ids:
+                specs += list(CLUSTER_COMMANDS)
+            self.progress[d["id"]] = "접속 중"
+
+            def prog(msg: str, did=d["id"], name=d["name"]) -> None:
+                self.progress[did] = msg[len(name):].strip() if msg.startswith(name) else msg
+
+            dc = collect_device(self.driver, d, specs, self.creds.get(d["credential"]), ssh, prog,
+                                deadline=started_at[d["id"]] + limits[d["id"]], holder=holders[d["id"]])
+            self.progress[d["id"]] = "완료" if dc.connected else "실패"
+            return dc
+
+        got: dict[str, DeviceCollection] = {}
+        if devices:
+            # 장비마다 제한 시간을 두고, 넘기면 세션을 끊고 '응답 없음'으로 처리해 점검이 반드시 끝나게 함
+            pool = ThreadPoolExecutor(max_workers=max(1, int(ssh.get("parallel", 6))), thread_name_prefix="netcheck-dev")
+            futs = {pool.submit(job, d): d for d in devices}
+            pending = set(futs)
+            try:
+                while pending:
+                    done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        d = futs[f]
+                        try:
+                            got[d["id"]] = f.result()
+                        except Exception as exc:  # pragma: no cover - 방어
+                            log.exception("%s 점검 오류", d["name"])
+                            got[d["id"]] = DeviceCollection(device_id=d["id"], connected=False, started=time.time(),
+                                                            error=f"점검 중 오류: {type(exc).__name__} {exc}",
+                                                            error_kind="error", finished=time.time())
+                    now_t = time.time()
+                    for f in list(pending):
+                        d = futs[f]
+                        st = started_at.get(d["id"])
+                        if st and now_t - st > limits[d["id"]] + self.device_grace:
+                            pending.discard(f)
+                            _abort_session(holders[d["id"]])
+                            mins = max(1, round((now_t - st) / 60))
+                            log.warning("%s: %d분 넘게 응답이 없어 이 장비 점검을 중단합니다", d["name"], mins)
+                            self.progress[d["id"]] = "응답 없음"
+                            got[d["id"]] = DeviceCollection(
+                                device_id=d["id"], connected=False, started=st, finished=now_t, error_kind="timeout",
+                                error=(f"응답 없음: {mins}분 넘게 점검이 끝나지 않아 이 장비는 중단했습니다. "
+                                       "장비 부하·회선 상태를 확인하거나 설정 → 접속 대기 시간을 조정하세요."))
+                    if gen and gen != self._gen:
+                        raise _Abandoned()
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+        collections: dict[str, DeviceCollection] = {d["id"]: got[d["id"]] for d in devices if d["id"] in got}
+
+        # 클러스터 명령: 클러스터마다 대표 WLC에서, 실패하면 같은 클러스터의 다른 WLC에서 다시 시도
+        clusters: dict[str, dict] = {}
+        for name, members in groups.items():
+            primary = primaries[name]
+            cluster = None
+            order = [primary] + [w for w in members if w["id"] != primary["id"]]
+            for w in order:
+                dc = collections.get(w["id"])
+                if dc and dc.connected and "membership" in dc.results:
+                    cluster = {"membership": dc.results.get("membership"), "load": dc.results.get("load"),
+                               "source": w["name"], "source_id": w["id"]}
+                    if dc.results["membership"].ok or dc.results.get("load", CmdResult("", "", "", "", False)).ok:
+                        break
+                    continue
+                if dc and dc.connected:
+                    extra = collect_device(self.driver, w, list(CLUSTER_COMMANDS), self.creds.get(w["credential"]), ssh)
+                    if extra.connected:
+                        dc.results.update(extra.results)
+                        cluster = {"membership": extra.results.get("membership"), "load": extra.results.get("load"),
+                                   "source": w["name"], "source_id": w["id"]}
+                        if extra.results["membership"].ok:
+                            break
+            if cluster:
+                clusters[name] = cluster
+
+        if gen and gen != self._gen:
+            raise _Abandoned()
+        prev_run = self.store.get_run()
+        evaluation, new_base = evaluate_run(cfg, collections, clusters, self.store.baselines(),
+                                            self.store.previous_metrics(), now=started)
+        finished = time.time() if now is None else started + 40
+        run_id = self.store.save_run(started, finished, trigger, evaluation, collections, clusters)
+        self.store.save_baselines(new_base)
+        self.store.add_events(self._diff_events(prev_run, evaluation, run_id, started))
+        try:
+            self.store.add_vrrp(self._vrrp_rows(prev_run, evaluation, run_id, started))
+        except Exception:  # pragma: no cover - 이력 기록 실패가 점검을 막지 않도록
+            log.exception("VRRP 이력 기록 실패")
+        self.store.prune(cfg["retention_days"])
+        self.last_error = ""
+        self._after_run(cfg, run_id)
+        return run_id
+
+    # ------------------------------------------------------------- 점검 후: 엑셀 저장, 알림
+    reports_dir: Path | None = None   # app.py가 지정(기본: 프로그램 폴더\보고서)
+    last_report: str = ""
+
+    def report_folder(self, cfg: dict | None = None) -> Path:
+        cfg = cfg or self.cfg.get()
+        folder = cfg["report"].get("folder")
+        return Path(folder) if folder else (self.reports_dir or Path("보고서"))
+
+    def _after_run(self, cfg: dict, run_id: int) -> None:
+        if self.demo_quiet:
+            return
+        run = self.store.get_run(run_id)
+        if run is None:
+            return
+        rep = cfg["report"]
+        saved = ""
+        if rep.get("excel_auto"):
+            try:
+                from .excel import save_report
+
+                path = save_report(run, cfg.get("site_name", ""), cfg["thresholds"],
+                                   lambda dev, cmd: self.store.get_raw(run_id, dev, cmd),
+                                   self.report_folder(cfg), cfg["retention_days"])
+                saved = str(path)
+                self.last_report = saved
+            except Exception as exc:
+                log.warning("엑셀 보고서 저장 실패: %s", exc)
+                self.last_error = f"엑셀 보고서를 저장하지 못했습니다: {type(exc).__name__} {exc}"
+        if rep.get("notify"):
+            try:
+                from .notify import completion_message, show_toast
+
+                title, lines = completion_message(run)
+                show_toast(title, lines)
+            except Exception as exc:  # pragma: no cover
+                log.warning("알림 실패: %s", exc)
+
+    demo_quiet = False   # 데모 이력 채우는 동안에는 알림을 띄우지 않음
+
+    @staticmethod
+    def _vrrp_rows(prev: dict | None, cur: dict, run_id: int, ts: float) -> list[dict]:
+        """VRRP 변경 이력: (1) 직전 점검과 역할이 달라진 그룹, (2) 장비 로그(logbuffer)의 VRRP 상태 변경.
+        둘이 같은 변경이면 한 줄로 합쳐 장비 로그의 정확한 시각을 붙입니다."""
+        from .parsers import vrrp_group_key
+
+        rows: list[dict] = []
+        prev_devs = (prev or {}).get("devices", {})
+        prev_ts = (prev or {}).get("started")
+        for dev_id, res in cur["devices"].items():
+            m = res.get("metrics") or {}
+            logs = list(m.get("vrrp_logs") or [])
+            used: set[int] = set()
+            old = ((prev_devs.get(dev_id) or {}).get("metrics") or {}).get("vrrp") or {}
+            norm = lambda k: vrrp_group_key(*k.rsplit("/", 1)) if "/" in k else k
+            old_n = {norm(k): v for k, v in old.items()}
+            for k, v in (m.get("vrrp") or {}).items():
+                g = norm(k)
+                if g not in old_n or old_n[g] == v:
+                    continue
+                row = {"device_id": dev_id, "device_name": res["name"], "grp": g, "old": old_n[g], "new": v,
+                       "detected": ts, "prev_check": prev_ts, "run_id": run_id, "source": "check"}
+                vrid = g.rsplit("/", 1)[-1]
+                for i, x in enumerate(logs):
+                    if i not in used and x["vrid"] == vrid and x["new"] == v:
+                        used.add(i)
+                        row.update(log_time=x["time"], log_ts=x["ts"], text=x["text"], source="check+log")
+                        break
+                rows.append(row)
+            for i, x in enumerate(logs):
+                if i in used:
+                    continue
+                rows.append({"device_id": dev_id, "device_name": res["name"], "grp": x["group"], "old": x["old"],
+                             "new": x["new"], "log_time": x["time"], "log_ts": x["ts"], "detected": ts,
+                             "prev_check": prev_ts, "run_id": run_id, "source": "log", "text": x["text"]})
+        return rows
+
+    @staticmethod
+    def _diff_events(prev: dict | None, cur: dict, run_id: int, ts: float) -> list[tuple]:
+        events = []
+        prev_devs = (prev or {}).get("devices", {})
+        for dev_id, res in cur["devices"].items():
+            # 계정 미입력은 장비 상태 변화가 아니므로 기록하지 않음(화면 상단 안내로 대신)
+            bad = lambda c: c["level"] in ("warn", "crit", "unknown") and c.get("source") != "credential"
+            before = {(c["key"]): c for c in prev_devs.get(dev_id, {}).get("checks", []) if bad(c)}
+            now_bad = {(c["key"]): c for c in res["checks"] if bad(c)}
+            for key, c in now_bad.items():
+                old = before.get(key)
+                if old is None or old["level"] != c["level"]:
+                    events.append((ts, run_id, dev_id, c["level"], "new", f"{res['name']} · {c['label']}: {c['summary']}"))
+            for key, c in before.items():
+                if key not in now_bad and prev is not None:
+                    events.append((ts, run_id, dev_id, "ok", "recovered", f"{res['name']} · {c['label']} 정상 복귀"))
+        return events
+
+    # ------------------------------------------------------------- 직접 확인
+    def console(self, device_id: str, command: str) -> dict[str, Any]:
+        reason = check_console_command(command)
+        if reason:
+            return {"ok": False, "error": reason}
+        cfg = self.cfg.get()
+        dev = next((d for d in cfg["devices"] if d["id"] == device_id), None)
+        if dev is None:
+            return {"ok": False, "error": "장비를 찾을 수 없습니다."}
+        cred = self.creds.get(dev["credential"])
+        if cred is None:
+            return {"ok": False, "error": "이 장비의 접속 계정을 먼저 입력하세요."}
+        from .collector import ConnectFailure
+        from .commands import CommandSpec
+        t0 = time.time()
+        try:
+            from .config import ssh_for
+
+            dssh = ssh_for(dev, cfg["ssh"])
+            session = self.driver.open(dev, cred, dssh)
+        except ConnectFailure as exc:
+            return {"ok": False, "error": str(exc)}
+        try:
+            r = run_spec(session, CommandSpec("console", command, (" ".join(command.split()),), timeout=60), dssh)
+        finally:
+            session.close()
+        return {"ok": r.ok, "error": r.error, "output": r.output, "command": r.command, "duration": round(time.time() - t0, 1)}
+
+    # ------------------------------------------------------------- 스케줄러
+    def start_scheduler(self) -> None:
+        threading.Thread(target=self._scheduler_loop, name="netcheck-scheduler", daemon=True).start()
+
+    def reschedule(self) -> None:
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def _scheduler_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._scheduler_step()
+            except Exception:  # pragma: no cover - 방어: 스케줄러가 죽지 않도록
+                log.exception("자동 점검 예약 처리 오류")
+                self._stop.wait(30)
+
+    def _scheduler_step(self) -> None:
+        cfg = self.cfg.get()
+        sched = cfg["schedule"]
+        now = time.time()
+        if not sched["enabled"] or not cfg["devices"]:
+            self.next_run = None
+            self._wake.wait(30)
+            self._wake.clear()
+            return
+        if self.next_run is None or self._wake.is_set():
+            self._wake.clear()
+            self.next_run = next_slot(now, sched["interval_minutes"], sched["align_to_clock"], self._last_auto_start)
+        wait = self.next_run - now
+        if wait > 0:
+            self._wake.wait(min(wait, 30))
+            if self._wake.is_set() and not self.running:
+                self._wake.clear()
+                self.next_run = next_slot(time.time(), sched["interval_minutes"], sched["align_to_clock"], self._last_auto_start)
+            return
+        self._last_auto_start = time.time()
+        self.next_run = None
+        self.abandon_stuck_run()
+        if not self.start_check("auto"):
+            log.info("이전 점검이 진행 중이라 이번 자동 점검은 건너뜁니다")
+        time.sleep(1)

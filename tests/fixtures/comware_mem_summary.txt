@@ -1,0 +1,5 @@
+<BB-3>show memory summary
+Memory statistics are measured in KB:
+Slot Total      Used       Free       Shared     Buffers    Cached     FreeRatio
+1    8018440    1503612    6514828    0          2208       454056     81.2%
+2    8018440    5503612    2514828    0          2208       454056     31.4%

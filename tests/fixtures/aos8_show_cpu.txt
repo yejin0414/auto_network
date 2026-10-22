@@ -1,0 +1,2 @@
+(WLC-01) #show cpu
+user 7.2%, system 9.1%, idle 83.7%

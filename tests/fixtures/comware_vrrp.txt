@@ -1,0 +1,9 @@
+<BB-3>display vrrp
+IPv4 Virtual Router Information:
+ Running mode : Standard
+ Total number of virtual routers : 2
+ Interface          VRID  State        Running  Adver   Auth     Virtual
+                                       Pri      Timer   Type        IP
+ ---------------------------------------------------------------------
+ Vlan10             10    Master       120      100     None     192.0.2.131
+ Vlan20             20    Backup       100      100     None     192.0.2.141

@@ -1,0 +1,10 @@
+<BB-3>display ospf peer
+
+         OSPF Process 1 with Router ID 203.0.113.3
+               Neighbor Brief Information
+
+ Area: 0.0.0.0
+ Router ID       Address         Pri Dead-Time  State             Interface
+ 203.0.113.4      192.0.2.102        1   37         Full/BDR          Vlan100
+ 203.0.113.1      192.0.2.111        1   33         Full/DR           Vlan101
+ 203.0.113.2      192.0.2.121        1   31         Init/DROther      Vlan102

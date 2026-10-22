@@ -1,0 +1,3 @@
+(WLC-01) #show memory
+
+Memory (Kb): total: 3949512, used: 1872100, free: 2077412

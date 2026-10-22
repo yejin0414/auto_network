@@ -1,0 +1,169 @@
+{
+  "site_name": "무선랜 운영",
+  "devices": [
+    {
+      "id": "bb1",
+      "name": "백본 1호기",
+      "role": "BB",
+      "host": "192.0.2.1",
+      "port": 22,
+      "protocol": "ssh",
+      "enabled": true
+    },
+    {
+      "id": "bb2",
+      "name": "백본 2호기",
+      "role": "BB",
+      "host": "192.0.2.2",
+      "port": 22,
+      "protocol": "ssh",
+      "enabled": true
+    },
+    {
+      "id": "bb3",
+      "name": "백본 3호기",
+      "role": "BB",
+      "host": "192.0.2.3",
+      "port": 22,
+      "protocol": "ssh",
+      "enabled": true
+    },
+    {
+      "id": "bb4",
+      "name": "백본 4호기",
+      "role": "BB",
+      "host": "192.0.2.4",
+      "port": 22,
+      "protocol": "ssh",
+      "enabled": true
+    },
+    {
+      "id": "mm1",
+      "name": "MM-01",
+      "role": "MM",
+      "host": "192.0.2.10",
+      "port": 22,
+      "enabled": true
+    },
+    {
+      "id": "mm2",
+      "name": "MM-02",
+      "role": "MM",
+      "host": "192.0.2.11",
+      "port": 22,
+      "enabled": true
+    },
+    {
+      "id": "wlc1",
+      "name": "WLC-IN-01",
+      "role": "WLC",
+      "host": "198.51.100.11",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": true,
+      "cluster": "IN"
+    },
+    {
+      "id": "wlc2",
+      "name": "WLC-IN-02",
+      "role": "WLC",
+      "host": "198.51.100.12",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "IN"
+    },
+    {
+      "id": "wlc3",
+      "name": "WLC-IN-03",
+      "role": "WLC",
+      "host": "198.51.100.13",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "IN"
+    },
+    {
+      "id": "wlc4",
+      "name": "WLC-IN-04",
+      "role": "WLC",
+      "host": "198.51.100.14",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "IN"
+    },
+    {
+      "id": "wlc5",
+      "name": "WLC-OUT-01",
+      "role": "WLC",
+      "host": "198.51.100.15",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": true,
+      "cluster": "OUT"
+    },
+    {
+      "id": "wlc6",
+      "name": "WLC-OUT-02",
+      "role": "WLC",
+      "host": "198.51.100.16",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "OUT"
+    },
+    {
+      "id": "wlc7",
+      "name": "WLC-OUT-03",
+      "role": "WLC",
+      "host": "198.51.100.17",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "OUT"
+    },
+    {
+      "id": "wlc8",
+      "name": "WLC-OUT-04",
+      "role": "WLC",
+      "host": "198.51.100.18",
+      "port": 22,
+      "enabled": true,
+      "cluster_primary": false,
+      "cluster": "OUT"
+    }
+  ],
+  "schedule": {
+    "enabled": false,
+    "interval_minutes": 60,
+    "align_to_clock": true,
+    "background": false
+  },
+  "thresholds": {
+    "cpu_warn": 50,
+    "cpu_crit": 70,
+    "mem_warn": 60,
+    "mem_crit": 70,
+    "client_ratio_pct": 25,
+    "client_min_total": 50
+  },
+  "ssh": {
+    "bb_connect_timeout": 120,
+    "bb_command_timeout": 120,
+    "ctrl_connect_timeout": 60,
+    "ctrl_command_timeout": 60,
+    "parallel": 6,
+    "retries": 1
+  },
+  "extra_commands": {
+    "BB": [],
+    "MM": [],
+    "WLC": []
+  },
+  "retention_days": 30,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8875
+  }
+}

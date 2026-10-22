@@ -1,0 +1,5 @@
+<BB-3>display version
+HPE Comware Software, Version 7.1.070, Release 2609
+Copyright (c) 2010-2020 Hewlett Packard Enterprise Development LP
+HPE FF 5940 48SFP+ 6QSFP28 Switch uptime is 0 weeks, 12 days, 3 hours, 41 minutes
+Last reboot reason : User reboot

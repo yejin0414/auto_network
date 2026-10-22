@@ -1,0 +1,11 @@
+(WLC-01) # show lc-cluster load distribution client
+
+IP Address       Active Clients    Standby Clients
+----------       --------------    ---------------
+192.0.2.11       250               260
+192.0.2.12       260               250
+192.0.2.13       245               255
+192.0.2.14       260               250
+
+Total: Active Clients 1,015
+(WLC-01) #

@@ -1,0 +1,4 @@
+<BB-3>display fan
+ Slot 1:
+ Fan Frame 1 State: Normal
+ Fan Frame 2 State: Normal

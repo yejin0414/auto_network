@@ -1,0 +1,9 @@
+<BB-3>display cpu-usage
+Slot 1 CPU 0 CPU usage:
+       6% in last 5 seconds
+       7% in last 1 minute
+       6% in last 5 minutes
+Slot 2 CPU 0 CPU usage:
+      12% in last 5 seconds
+      11% in last 1 minute
+       9% in last 5 minutes
