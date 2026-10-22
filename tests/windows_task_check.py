@@ -5,6 +5,7 @@
 3) 설정에서 주기를 바꾸면 작업도 바뀌는지
 4) 프로그램(창)이 꺼져 있을 때 --auto-check 가 창 없이 점검 → 기록 저장 → 엑셀 저장까지 하는지
 5) 설정에서 '창을 닫아도 자동 점검'을 끄면 작업이 지워지는지
+6) 여러 주기를 연속 저장하고 마지막에 끈 뒤 즉시 종료해도 작업이 남지 않는지
 
     python tests/windows_task_check.py dist\\NetcheckCenter\\NetcheckCenter.exe
 """
@@ -96,7 +97,7 @@ def stop_gui(p):
     except Exception:
         pass
     try:
-        p.wait(30)
+        p.wait(75)  # 종료 동기화 최대 65초 + 프로세스 정리 여유
     except subprocess.TimeoutExpired:
         p.kill()
 
@@ -169,6 +170,23 @@ try:
         call("/api/config", cfg)
         wait_xml(lambda x: x == "", "끄기를 했는데 작업이 남아 있음")
         print("5) '창을 닫아도 자동 점검' 끄면 작업 삭제 OK")
+
+        # 단일 worker의 최신 설정 반영과 종료 drain을 실제 EXE/API로 확인.
+        # 의도적 작업 지연/역순 callback은 test_schedule_sync의 Event mock으로 검증합니다.
+        cfg["schedule"]["background"] = True
+        for interval in (15, 45, 10, 30):
+            cfg["schedule"]["interval_minutes"] = interval
+            call("/api/config", cfg)
+        cfg["schedule"]["background"] = False
+        call("/api/config", cfg)
+        call("/api/quit", {})
+        gui.wait(75)
+        assert gui.returncode == 0, f"설정 저장 직후 정상 종료 실패: {gui.returncode}"
+        wait_xml(lambda x: x == "", "연속 저장 후 종료했는데 오래된 설정의 작업이 남아 있음")
+        saved = json.loads((work / "config" / "config.json").read_text(encoding="utf-8"))
+        assert saved["schedule"]["background"] is False
+        assert saved["schedule"]["interval_minutes"] == 30
+        print("6) 연속 주기 저장 → 최종 끄기 → 즉시 종료 후 작업 부재 OK")
     finally:
         stop_gui(gui)
     print("작업 등록/변경/해제 및 직접 --auto-check 실행 검증 통과; 실제 예약 실행은 위 별도 결과 참조")

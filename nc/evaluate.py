@@ -361,10 +361,13 @@ def evaluate_run(
             mem = {x["ip"]: x for x in P.parse_membership(mr.output)}
         if lr and lr.ok:
             ld = P.parse_load_distribution(lr.output)
+        sources = {key: dict(((cl.get("sources") or {}).get(key) or {}) if "sources" in cl else
+                            {"id": cl.get("source_id"), "name": cl.get("source")})
+                   for key in ("membership", "load")}
         gdata[gname] = {"membership": mem, "load": ld, "source": cl.get("source"),
-                        "membership_result": mr, "load_result": lr}
+                        "membership_result": mr, "load_result": lr, "sources": sources}
     empty_group = {"membership": {}, "load": {"rows": {}, "total_active": None}, "source": None,
-                   "membership_result": None, "load_result": None}
+                   "membership_result": None, "load_result": None, "sources": {}}
     cl_base = baselines.get("__cluster__", {})
     conn_base = dict(cl_base.get("conn_type", {}))
 
@@ -435,6 +438,17 @@ def evaluate_run(
             reason = (lr.error if lr and not lr.ok else "") or "이 WLC의 Client 분배를 수집하거나 해석하지 못했습니다."
             res["checks"].append(check("clients", "Client 분배", "unknown", reason,
                                        [lr.output[:300]] if lr and lr.output else [], lr, source=cl_source))
+        # The raw command may belong to a different WLC than the evaluated row.
+        # Keep both the visible source and the raw-output owner per command.
+        for item in res["checks"]:
+            key = {"cluster": "membership", "clients": "load"}.get(item["key"])
+            if key is None:
+                continue
+            source = g["sources"].get(key) or {}
+            result = g.get(f"{key}_result")
+            item.update(source=source.get("name") or "", source_id=source.get("id") or "",
+                        cmd_id=result.id if result and source.get("id") else "",
+                        command=result.command if result and source.get("id") else "")
 
     if conn_base != cl_base.get("conn_type", {}):
         new_baselines["__cluster__"] = {**cl_base, "conn_type": conn_base}
@@ -471,6 +485,7 @@ def evaluate_run(
         mem = [c for c in cluster_members if c["cluster"] == gname]
         cluster_summary.append({
             "name": gname, "members": len(mem), "source": g["source"],
+            "sources": g["sources"],
             "connected": sum(1 for c in mem if c["state"] == "CONNECTED"),
             "mm_up": sum(1 for c in mem if c["mm_status"] == "Up"),
             "leader": next((c["name"] for c in mem if c["role"] == "Leader"), ""),

@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .collector import CmdResult, DeviceCollection, collect_device, run_spec
+from . import parsers as P
+from .collector import CmdResult, DeviceCollection, collect_device, run_spec, safe_error
 from .commands import CLUSTER_COMMANDS, check_console_command, commands_for
 from .config import ConfigStore, ssh_for
 from .credentials import CredentialStore
@@ -77,6 +78,7 @@ class Engine:
         self._gen = 0                 # 점검 회차 번호(멈춘 점검을 버릴 때 사용)
         self.max_run_seconds = 40 * 60  # 이보다 오래 걸리는 점검은 멈춘 것으로 보고 다음 점검을 막지 않음
         self.device_grace = 45.0        # 장비 제한 시간 뒤 이만큼 더 기다렸다가 강제 중단
+        self.cluster_fallback_seconds = 300.0  # 모든 클러스터 대체 수집을 합친 시간 예산
 
     # ------------------------------------------------------------- 상태
     def status(self) -> dict[str, Any]:
@@ -148,6 +150,140 @@ class Engine:
         log.warning(self.last_error)
         return True
 
+    def _run_cancelled(self, gen: int) -> bool:
+        return self._stop.is_set() or bool(gen and gen != self._gen)
+
+    def _set_progress(self, gen: int, device_id: str, message: str) -> None:
+        with self._lock:
+            if not self._run_cancelled(gen):
+                self.progress[device_id] = message
+
+    @staticmethod
+    def _cluster_result_usable(key: str, result: CmdResult | None) -> bool:
+        if result is None or not result.ok:
+            return False
+        if key == "membership":
+            # Missing peers and explicit failed states are real observations,
+            # not reasons to replace this snapshot with a healthier peer view.
+            # If no status was readable at all, try another collector.
+            return any(row["state"] for row in P.parse_membership(result.output))
+        return bool(P.parse_load_distribution(result.output)["rows"])
+
+    def _cluster_attempt(self, device: dict, specs: list, ssh: dict, deadline: float, gen: int) -> dict[str, CmdResult]:
+        """daemon 작업을 감독해 open/run/close가 멈춰도 전체 예산 안에 반환합니다.
+
+        worker는 지역 상태에만 기록합니다. 제한 시각 전에 완료된 명령만 복사하고
+        취소 뒤 늦게 반환한 세션/결과는 현재 회차나 다음 회차에 반영하지 않습니다.
+        """
+        done, cancel = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        holder: dict = {}
+        state: dict = {"results": {}, "error": ""}
+        started = time.time()
+
+        def cancelled() -> bool:
+            return cancel.is_set() or self._run_cancelled(gen) or time.monotonic() >= deadline
+
+        def receive(result: CmdResult) -> None:
+            with lock:
+                if not cancelled():
+                    state["results"][result.id] = result
+
+        def work() -> None:
+            try:
+                collection = collect_device(
+                    self.driver, device, specs, self.creds.get(device["credential"]), ssh,
+                    deadline=time.time() + max(0.0, deadline - time.monotonic()), holder=holder,
+                    cancelled=cancelled, on_result=receive,
+                )
+                with lock:
+                    if not cancelled():
+                        state["error"] = collection.error
+            except Exception as exc:
+                with lock:
+                    if not cancelled():
+                        state["error"] = f"대체 수집 실패: {type(exc).__name__} {safe_error(exc)}"
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name="netcheck-cluster", daemon=True).start()
+        try:
+            while not done.is_set() and not cancelled():
+                done.wait(min(0.05, max(0.0, deadline - time.monotonic())))
+            with lock:
+                cancel.set()
+                results = dict(state["results"])
+                error = state["error"]
+        finally:
+            cancel.set()
+            if not done.is_set():
+                _abort_session(holder)
+        if self._run_cancelled(gen):
+            raise _Abandoned()
+        reason = error or ("클러스터 대체 수집 시간 예산 초과" if time.monotonic() >= deadline else "클러스터 명령을 수집하지 못했습니다.")
+        for spec in specs:
+            if spec.id not in results:
+                results[spec.id] = CmdResult(spec.id, spec.label, spec.commands[0], "", False, reason,
+                                             round(time.time() - started, 2), spec.optional)
+        return results
+
+    def _collect_clusters(self, groups: dict, primaries: dict, collections: dict,
+                          ssh: dict, gen: int) -> dict[str, dict]:
+        deadline = time.monotonic() + max(0.0, self.cluster_fallback_seconds)
+        clusters: dict[str, dict] = {}
+        for name, members in groups.items():
+            cluster: dict = {"sources": {}}
+
+            def merge(device: dict, results: dict) -> None:
+                for spec in CLUSTER_COMMANDS:
+                    if self._cluster_result_usable(spec.id, cluster.get(spec.id)):
+                        continue
+                    result = results.get(spec.id)
+                    if result is not None:
+                        cluster[spec.id] = result
+                        cluster["sources"][spec.id] = {"id": device["id"], "name": device["name"]}
+
+            primary = primaries[name]
+            order = [primary] + [w for w in members if w["id"] != primary["id"]]
+            # Preserve every usable result already collected before opening a fallback session.
+            for w in order:
+                dc = collections.get(w["id"])
+                if dc and dc.connected:
+                    merge(w, dc.results)
+            for w in order[1:]:
+                if self._run_cancelled(gen):
+                    raise _Abandoned()
+                missing = [spec for spec in CLUSTER_COMMANDS if not self._cluster_result_usable(spec.id, cluster.get(spec.id))]
+                if not missing or time.monotonic() >= deadline:
+                    break
+                dc = collections.get(w["id"])
+                if not dc or not dc.connected:
+                    continue
+                results = self._cluster_attempt(w, missing, ssh, deadline, gen)
+                with self._lock:
+                    if self._run_cancelled(gen):
+                        raise _Abandoned()
+                    dc.results.update(results)
+                    merge(w, results)
+            if self._run_cancelled(gen):
+                raise _Abandoned()
+            for spec in CLUSTER_COMMANDS:
+                if spec.id not in cluster:
+                    cluster[spec.id] = CmdResult(spec.id, spec.label, spec.commands[0], "", False,
+                                                "클러스터 대체 수집 시간 예산 초과" if time.monotonic() >= deadline
+                                                else "접속 가능한 클러스터 수집 장비가 없습니다.")
+            sources = cluster["sources"]
+            ids = {s["id"] for s in sources.values()}
+            if len(ids) == 1:
+                source = next(iter(sources.values()))
+                cluster.update(source=source["name"], source_id=source["id"])
+            else:
+                labels = {"membership": "멤버십", "load": "Client 분배"}
+                cluster["source"] = " · ".join(f"{labels[key]} {sources[key]['name']}" for key in labels if key in sources) or None
+                cluster["source_id"] = None
+            clusters[name] = cluster
+        return clusters
+
     def _run(self, trigger: str, now: float | None, gen: int = 0) -> int:
         cfg = self.cfg.get()
         started = now or time.time()
@@ -163,24 +299,30 @@ class Engine:
             groups.setdefault(w.get("cluster", ""), []).append(w)
         primaries = {name: next((w for w in ws if w.get("cluster_primary")), ws[0]) for name, ws in groups.items()}
         primary_ids = {p["id"] for p in primaries.values()}
-        self.progress = {d["id"]: "대기" for d in devices}
+        with self._lock:
+            if self._run_cancelled(gen):
+                raise _Abandoned()
+            self.progress = {d["id"]: "대기" for d in devices}
         limits = {d["id"]: device_time_limit(d, ssh) for d in devices}
         started_at: dict[str, float] = {}
         holders: dict[str, dict] = {d["id"]: {} for d in devices}
 
         def job(d: dict) -> DeviceCollection:
+            if self._run_cancelled(gen):
+                raise _Abandoned()
             started_at[d["id"]] = time.time()
             specs = commands_for(d["role"], cfg["extra_commands"].get(d["role"]))
             if d["id"] in primary_ids:
                 specs += list(CLUSTER_COMMANDS)
-            self.progress[d["id"]] = "접속 중"
+            self._set_progress(gen, d["id"], "접속 중")
 
             def prog(msg: str, did=d["id"], name=d["name"]) -> None:
-                self.progress[did] = msg[len(name):].strip() if msg.startswith(name) else msg
+                self._set_progress(gen, did, msg[len(name):].strip() if msg.startswith(name) else msg)
 
             dc = collect_device(self.driver, d, specs, self.creds.get(d["credential"]), ssh, prog,
-                                deadline=started_at[d["id"]] + limits[d["id"]], holder=holders[d["id"]])
-            self.progress[d["id"]] = "완료" if dc.connected else "실패"
+                                deadline=started_at[d["id"]] + limits[d["id"]], holder=holders[d["id"]],
+                                cancelled=lambda: self._run_cancelled(gen))
+            self._set_progress(gen, d["id"], "완료" if dc.connected else "실패")
             return dc
 
         got: dict[str, DeviceCollection] = {}
@@ -191,7 +333,11 @@ class Engine:
             pending = set(futs)
             try:
                 while pending:
+                    if self._run_cancelled(gen):
+                        raise _Abandoned()
                     done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                    if self._run_cancelled(gen):
+                        raise _Abandoned()
                     for f in done:
                         d = futs[f]
                         try:
@@ -210,43 +356,23 @@ class Engine:
                             _abort_session(holders[d["id"]])
                             mins = max(1, round((now_t - st) / 60))
                             log.warning("%s: %d분 넘게 응답이 없어 이 장비 점검을 중단합니다", d["name"], mins)
-                            self.progress[d["id"]] = "응답 없음"
+                            self._set_progress(gen, d["id"], "응답 없음")
                             got[d["id"]] = DeviceCollection(
                                 device_id=d["id"], connected=False, started=st, finished=now_t, error_kind="timeout",
                                 error=(f"응답 없음: {mins}분 넘게 점검이 끝나지 않아 이 장비는 중단했습니다. "
                                        "장비 부하·회선 상태를 확인하거나 설정 → 접속 대기 시간을 조정하세요."))
-                    if gen and gen != self._gen:
+                    if self._run_cancelled(gen):
                         raise _Abandoned()
             finally:
+                if self._run_cancelled(gen):
+                    for holder in holders.values():
+                        _abort_session(holder)
                 pool.shutdown(wait=False, cancel_futures=True)
         collections: dict[str, DeviceCollection] = {d["id"]: got[d["id"]] for d in devices if d["id"] in got}
 
-        # 클러스터 명령: 클러스터마다 대표 WLC에서, 실패하면 같은 클러스터의 다른 WLC에서 다시 시도
-        clusters: dict[str, dict] = {}
-        for name, members in groups.items():
-            primary = primaries[name]
-            cluster = None
-            order = [primary] + [w for w in members if w["id"] != primary["id"]]
-            for w in order:
-                dc = collections.get(w["id"])
-                if dc and dc.connected and "membership" in dc.results:
-                    cluster = {"membership": dc.results.get("membership"), "load": dc.results.get("load"),
-                               "source": w["name"], "source_id": w["id"]}
-                    if dc.results["membership"].ok or dc.results.get("load", CmdResult("", "", "", "", False)).ok:
-                        break
-                    continue
-                if dc and dc.connected:
-                    extra = collect_device(self.driver, w, list(CLUSTER_COMMANDS), self.creds.get(w["credential"]), ssh)
-                    if extra.connected:
-                        dc.results.update(extra.results)
-                        cluster = {"membership": extra.results.get("membership"), "load": extra.results.get("load"),
-                                   "source": w["name"], "source_id": w["id"]}
-                        if extra.results["membership"].ok:
-                            break
-            if cluster:
-                clusters[name] = cluster
+        clusters = self._collect_clusters(groups, primaries, collections, ssh, gen)
 
-        if gen and gen != self._gen:
+        if self._run_cancelled(gen):
             raise _Abandoned()
         prev_run = self.store.get_run()
         evaluation, new_base = evaluate_run(cfg, collections, clusters, self.store.baselines(),
@@ -441,23 +567,29 @@ class Engine:
                 self._stop.wait(30)
 
     def _scheduler_step(self) -> None:
+        refresh = self._wake.is_set()
+        self._wake.clear()
         cfg = self.cfg.get()
         sched = cfg["schedule"]
         now = time.time()
-        if not sched["enabled"] or not cfg["devices"]:
+        active = any(d.get("enabled", True) for d in cfg["devices"])
+        signature = (sched["enabled"], sched["interval_minutes"], sched["align_to_clock"], active)
+        refresh = refresh or signature != getattr(self, "_schedule_signature", None)
+        self._schedule_signature = signature
+        if not sched["enabled"] or not active:
             self.next_run = None
             self._wake.wait(30)
-            self._wake.clear()
             return
-        if self.next_run is None or self._wake.is_set():
-            self._wake.clear()
+        if self.next_run is None or refresh:
             self.next_run = next_slot(now, sched["interval_minutes"], sched["align_to_clock"], self._last_auto_start)
         wait = self.next_run - now
         if wait > 0:
             self._wake.wait(min(wait, 30))
-            if self._wake.is_set() and not self.running:
-                self._wake.clear()
-                self.next_run = next_slot(time.time(), sched["interval_minutes"], sched["align_to_clock"], self._last_auto_start)
+            # Read fresh settings on the next step. Computing with this step's
+            # snapshot here would consume the wake and retain the old interval.
+            return
+        if self._wake.is_set() or self._stop.is_set():
+            # A change arrived after the snapshot; reconsider before starting.
             return
         self._last_auto_start = time.time()
         self.next_run = None

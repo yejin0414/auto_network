@@ -89,8 +89,9 @@ class Store:
             if clusters and "membership" in clusters:  # 예전 형식(클러스터 1개)
                 clusters = {"": clusters}
             for cluster in (clusters or {}).values():
-                src = cluster.get("source_id")
                 for key in ("membership", "load"):
+                    src = (((cluster.get("sources") or {}).get(key) or {}).get("id")
+                           if "sources" in cluster else cluster.get("source_id"))
                     r = cluster.get(key)
                     if r is not None and src:
                         rows.append((run_id, src, r.id, r.label, r.command, int(r.ok), r.error, r.duration,

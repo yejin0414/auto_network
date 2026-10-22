@@ -8,6 +8,7 @@ import mimetypes
 import secrets
 import socket
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,20 +36,24 @@ class App:
         self.on_focus = None  # 같은 버전을 또 실행했을 때 창을 앞으로
         self.on_config_saved = None  # 설정 저장 후(작업 스케줄러 갱신)
         self.background: dict = {}   # 창을 닫아도 자동 점검(작업 스케줄러) 등록 상태
+        self._config_lock = threading.RLock()
+        self._closing = False
         self.web_mode = False        # 웹 버전(브라우저를 닫아도 계속 실행)
         self.web_dir = web_dir
         self.token = secrets.token_urlsafe(24)
 
     # ------------------------------------------------------------- GET
     def state(self) -> dict[str, Any]:
-        cfg = self.engine.cfg.get()
+        with self._config_lock:
+            cfg = self.engine.cfg.get()
+            background = dict(self.background)
         return {
             "config": cfg,
             "version": self.version,
             "report_folder": str(self.engine.report_folder(cfg).resolve()),
             "last_report": self.engine.last_report,
             "windows": sys.platform == "win32",
-            "background": self.background,
+            "background": background,
             "web_mode": self.web_mode,
             "engine": self.engine.status(),
             "credentials": self.engine.creds.status(),
@@ -58,6 +63,19 @@ class App:
             "vrrp_unacked": self.engine.store.vrrp_unacked(),
             "latest_run_id": (self.engine.store.list_runs(1) or [{}])[0].get("id"),
         }
+
+    def publish_background(self, result: dict, schedule: dict) -> bool:
+        """Publish only a result matching the currently saved schedule."""
+        with self._config_lock:
+            if self.engine.cfg.get()["schedule"] != schedule:
+                return False
+            self.background = dict(result)
+            return True
+
+    def begin_shutdown(self) -> None:
+        # Wait for any accepted save and its wakeup before draining the worker.
+        with self._config_lock:
+            self._closing = True
 
     def handle_get(self, path: str, q: dict[str, str]) -> tuple[int, Any]:
         st = self.engine.store
@@ -140,18 +158,21 @@ class App:
             note = eng.creds.set(profile, Credential(user, pw), bool(body.get("remember")))
             return 200, {"ok": True, "note": note}
         if path == "/api/config":
-            try:
-                cfg = eng.cfg.save(body)
-            except ConfigError as exc:
-                return 400, {"error": str(exc)}
-            except (TypeError, ValueError) as exc:
-                return 400, {"error": f"설정 값을 확인하세요: {exc}"}
-            eng.reschedule()
-            if self.on_config_saved:
+            with self._config_lock:
+                if self._closing:
+                    return 503, {"error": "프로그램을 종료 중이므로 설정을 저장할 수 없습니다."}
                 try:
-                    self.on_config_saved(cfg)
-                except Exception:  # pragma: no cover
-                    log.exception("설정 저장 후 처리 실패")
+                    cfg = eng.cfg.save(body)
+                except ConfigError as exc:
+                    return 400, {"error": str(exc)}
+                except (TypeError, ValueError) as exc:
+                    return 400, {"error": f"설정 값을 확인하세요: {exc}"}
+                eng.reschedule()
+                if self.on_config_saved:
+                    try:
+                        self.on_config_saved(cfg)
+                    except Exception:  # pragma: no cover
+                        log.exception("설정 저장 후 처리 실패")
             return 200, {"ok": True, "config": cfg}
         if path == "/api/vrrp/ack":
             # 확인 · 초기화: 미확인 VRRP 변경을 확인 처리하고 그 백본의 VRRP 기준값만 지움 → 다음 점검부터 '역할 변화' 표시 없음

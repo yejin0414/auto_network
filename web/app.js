@@ -174,9 +174,10 @@
 
   function bgNote(st) {
     const sc = st.config.schedule, bg = st.background || {};
+    if (bg.pending) return "최신 자동 점검 설정을 Windows 작업에 반영하는 중입니다…";
+    if (bg.ok === false) return `<span style="color:var(--crit)">⚠ ${esc(bg.message || "작업 스케줄러 동기화 실패")}</span>${bg.retrying ? " — 잠시 후 최신 설정으로 다시 시도합니다." : ""}`;
     if (!sc.enabled) return "자동 점검이 꺼져 있습니다.";
     if (sc.background === false) return "프로그램 창이 켜져 있는(최소화 포함) 동안만 자동 점검합니다. 창을 닫으면 자동 점검도 멈춥니다.";
-    if (bg.ok === false) return `<span style="color:var(--crit)">⚠ ${esc(bg.message || "작업 스케줄러 등록 실패")}</span> — 창을 켜 두면(최소화 가능) 자동 점검은 계속됩니다.`;
     if (bg.registered) return "✓ 창을 닫아도 Windows 작업 스케줄러가 정해진 시간마다 창 없이 점검합니다(엑셀 저장·알림 포함). PC를 끄거나 로그아웃하면 멈추고, 절전에서 깨어나면 놓친 점검을 바로 합니다. 프로그램 폴더를 옮겼다면 프로그램을 한 번 실행하면 다시 맞춰집니다.";
     if (st.windows) return "창을 닫아도 점검하도록 Windows 작업 스케줄러에 등록하는 중입니다…";
     return "창을 닫아도 점검하는 기능은 Windows에서만 동작합니다.";
@@ -972,11 +973,12 @@
       <span class="lab">${esc(c.label)}</span>
       <div class="sum-col"><div class="sum">${esc(c.summary)}</div>
         ${c.evidence?.length ? `<div class="evid">${c.evidence.map(esc).join("\n")}</div>` : ""}
-        ${c.command ? `<div class="src mono">${esc(c.command)}</div>` : c.source ? `<div class="src">출처: ${esc(c.source)}</div>` : ""}</div>
-      <span class="act">${c.cmd_id ? `<button class="btn small" data-raw="${esc(c.cmd_id)}">원본</button>` : ""}</span>
+        ${c.command ? `<div class="src mono">${esc(c.command)}</div>` : ""}
+        ${c.source ? `<div class="src">출처: ${esc(c.source)}</div>` : ""}</div>
+      <span class="act">${c.cmd_id ? `<button class="btn small" data-raw="${esc(c.cmd_id)}" data-raw-device="${esc(c.source_id || r.id)}">원본</button>` : ""}</span>
     </div>`).join("") +
       `<div class="actions" style="justify-content:flex-start;margin-top:18px"><button class="btn small" data-console>이 장비에 직접 명령 실행</button></div>`;
-    $$("[data-raw]", box).forEach((b) => b.addEventListener("click", () => { S.dtab = "raw"; S.rawCmd = b.dataset.raw; renderDrawer(); }));
+    $$("[data-raw]", box).forEach((b) => b.addEventListener("click", () => { S.drawer = b.dataset.rawDevice || S.drawer; S.dtab = "raw"; S.rawCmd = b.dataset.raw; renderDrawer(); }));
     $("[data-gocred]", box)?.addEventListener("click", () => { closeDrawer(); gotoCredentials(); });
     $("[data-godiag]", box)?.addEventListener("click", () => { S.dtab = "diag"; renderDrawer(); runDiag(); });
     $("[data-console]", box).addEventListener("click", () => { const id = S.drawer; closeDrawer(); switchTab("console"); const s = $("#cDev"); if (s) { s.value = id; renderConsole(); } });
@@ -996,7 +998,7 @@
       try { raw = await api(`/api/raw?run=${S.run.id}&device=${encodeURIComponent(S.drawer)}&cmd=${encodeURIComponent(S.rawCmd)}`); S.rawCache[key] = raw; }
       catch (e) { raw = { output: "", error: e.message, command: "" }; }
     }
-    if (S.dtab !== "raw") return;
+    if (S.dtab !== "raw" || key !== `${S.run?.id}|${S.drawer}|${S.rawCmd}`) return;
     const meta = cmds.find((c) => c.cmd_id === S.rawCmd);
     $("#rawCmdLine").textContent = `> ${raw.command}${meta?.duration != null ? `   (${meta.duration}초)` : ""}${raw.error ? `   ${raw.error}` : ""}`;
     const show = (q) => {

@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import logging
+import csv
+import io
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -88,8 +91,8 @@ def build_xml(interval_minutes: int, align: bool, command: str, arguments: str, 
 """
 
 
-def _schtasks(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["schtasks", *args], capture_output=True, timeout=30, creationflags=NO_WINDOW)
+def _schtasks(*args: str, timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["schtasks", *args], capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
 
 
 def _out(r: subprocess.CompletedProcess) -> str:
@@ -102,19 +105,43 @@ def _out(r: subprocess.CompletedProcess) -> str:
     return raw.decode("utf-8", "replace").strip()
 
 
-def sync(schedule: dict) -> dict:
+def sync(schedule: dict, *, timeout: float = 30) -> dict:
     """설정에 맞게 작업을 등록/갱신/삭제합니다. 결과: {ok, registered, message}"""
     if sys.platform != "win32":
         return {"ok": True, "registered": False, "supported": False, "message": ""}
+    deadline = time.monotonic() + timeout
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Windows 작업 동기화 제한 시간을 초과했습니다.")
+        return _schtasks(*args, timeout=remaining)
+
     want = bool(schedule.get("enabled")) and bool(schedule.get("background", False))
     try:
         if not want:
-            if _schtasks("/Query", "/TN", TASK_NAME).returncode == 0:
-                removed = _schtasks("/Delete", "/TN", TASK_NAME, "/F")
+            query = run("/Query", "/TN", TASK_NAME)
+            if query.returncode == 0:
+                removed = run("/Delete", "/TN", TASK_NAME, "/F")
                 if removed.returncode != 0:
                     return {"ok": False, "registered": True, "supported": True,
                             "message": f"Windows 자동 점검 작업을 해제하지 못했습니다: {_out(removed)}"}
                 log.info("창을 닫았을 때 자동 점검(작업 스케줄러)을 해제했습니다")
+            else:
+                # A failed query may mean access denied or a temporary error,
+                # not necessarily an absent task. Confirm absence via a full
+                # successful listing before reporting that deletion is done.
+                listing = run("/Query", "/FO", "CSV", "/NH")
+                if listing.returncode != 0:
+                    return {"ok": False, "registered": None, "supported": True,
+                            "message": f"Windows 자동 점검 작업 상태를 확인하지 못했습니다: {_out(query)} {_out(listing)}"}
+                rows = list(csv.reader(io.StringIO(_out(listing))))
+                if any(len(row) < 3 for row in rows):
+                    return {"ok": False, "registered": None, "supported": True,
+                            "message": "Windows 작업 목록을 해석하지 못해 자동 점검 작업의 해제를 확인할 수 없습니다."}
+                if any(row[0].lstrip("\\").casefold() == TASK_NAME.casefold() for row in rows):
+                    return {"ok": False, "registered": True, "supported": True,
+                            "message": f"Windows 자동 점검 작업이 남아 있으나 상태를 읽지 못했습니다: {_out(query)}"}
             return {"ok": True, "registered": False, "supported": True, "message": ""}
         cmd, argv, wd = launch_command()
         xml = build_xml(int(schedule.get("interval_minutes", 60)), bool(schedule.get("align_to_clock", True)), cmd, argv, wd)
@@ -122,7 +149,7 @@ def sync(schedule: dict) -> dict:
         os.close(fd)
         try:
             Path(tmp).write_text(xml, encoding="utf-16")
-            r = _schtasks("/Create", "/TN", TASK_NAME, "/XML", tmp, "/F")
+            r = run("/Create", "/TN", TASK_NAME, "/XML", tmp, "/F")
         finally:
             try:
                 os.unlink(tmp)
@@ -131,13 +158,13 @@ def sync(schedule: dict) -> dict:
         if r.returncode != 0:
             msg = _out(r)
             log.warning("작업 스케줄러 등록 실패: %s", msg)
-            return {"ok": False, "registered": False, "supported": True,
+            return {"ok": False, "registered": None, "supported": True,
                     "message": f"Windows 작업 스케줄러에 등록하지 못했습니다: {msg}"}
         log.info("작업 스케줄러 등록: %s %s (%s분마다)", cmd, argv, schedule.get("interval_minutes"))
         return {"ok": True, "registered": True, "supported": True, "message": ""}
     except Exception as exc:  # pragma: no cover - 방어
         log.warning("작업 스케줄러 처리 실패: %s", exc)
-        return {"ok": False, "registered": False, "supported": True, "message": f"작업 스케줄러 처리 실패: {exc}"}
+        return {"ok": False, "registered": None, "supported": True, "message": f"작업 스케줄러 처리 실패: {exc}"}
 
 
 def query_xml() -> str:
