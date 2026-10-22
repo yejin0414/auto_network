@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -24,6 +25,9 @@ from .report import render
 
 log = logging.getLogger("netcheck")
 MAX_BODY = 256 * 1024
+STORAGE_READ_ERROR = "점검 DB를 읽지 못했습니다. 저장 공간과 파일 권한을 확인하세요. 기록이 없다는 뜻은 아닙니다."
+STORAGE_WRITE_ERROR = "점검 DB 작업을 완료하지 못했습니다. 저장 공간과 파일 권한을 확인한 뒤 다시 시도하세요."
+INVENTORY_CLEANUP_WARNING = "설정과 계정은 저장했지만 장비 기준값 정리를 완료하지 못했습니다. 저장 공간과 파일 권한을 확인한 뒤 다시 저장하세요."
 
 
 class App:
@@ -36,7 +40,7 @@ class App:
         self.on_focus = None  # 같은 버전을 또 실행했을 때 창을 앞으로
         self.on_config_saved = None  # 설정 저장 후(작업 스케줄러 갱신)
         self.background: dict = {}   # 창을 닫아도 자동 점검(작업 스케줄러) 등록 상태
-        self._config_lock = threading.RLock()
+        self._config_lock = getattr(engine, "persistence_lock", None) or threading.RLock()
         self._closing = False
         self.web_mode = False        # 웹 버전(브라우저를 닫아도 계속 실행)
         self.web_dir = web_dir
@@ -49,6 +53,14 @@ class App:
             background = dict(self.background)
             credentials = self.engine.creds.status()
             storage_uncertain = self.engine.creds.storage_uncertain
+            storage_error = ""
+            try:
+                baseline_times = self.engine.store.baseline_times()
+                vrrp_unacked = self.engine.store.vrrp_unacked()
+                latest_run_id = (self.engine.store.list_runs(1) or [{}])[0].get("id")
+            except (sqlite3.Error, OSError, ValueError):
+                baseline_times, vrrp_unacked, latest_run_id = {}, None, None
+                storage_error = STORAGE_READ_ERROR
         return {
             "config": cfg,
             "version": self.version,
@@ -62,9 +74,10 @@ class App:
             "credential_storage_uncertain": storage_uncertain,
             "credential_profiles": CREDENTIAL_PROFILES,
             "keyring": self.engine.creds.keyring_available,
-            "baseline_times": self.engine.store.baseline_times(),
-            "vrrp_unacked": self.engine.store.vrrp_unacked(),
-            "latest_run_id": (self.engine.store.list_runs(1) or [{}])[0].get("id"),
+            "baseline_times": baseline_times,
+            "vrrp_unacked": vrrp_unacked,
+            "latest_run_id": latest_run_id,
+            "storage_error": storage_error,
         }
 
     def publish_background(self, result: dict, schedule: dict) -> bool:
@@ -81,6 +94,12 @@ class App:
             self._closing = True
 
     def handle_get(self, path: str, q: dict[str, str]) -> tuple[int, Any]:
+        try:
+            return self._handle_get(path, q)
+        except (sqlite3.Error, OSError):
+            return 503, {"error": STORAGE_READ_ERROR}
+
+    def _handle_get(self, path: str, q: dict[str, str]) -> tuple[int, Any]:
         st = self.engine.store
         if path == "/api/state":
             return 200, self.state()
@@ -104,6 +123,13 @@ class App:
 
     # ------------------------------------------------------------- POST
     def handle_post(self, path: str, body: dict[str, Any]) -> tuple[int, Any]:
+        try:
+            return self._handle_post(path, body)
+        except sqlite3.Error:
+            self.engine.last_error = STORAGE_WRITE_ERROR
+            return 503, {"error": STORAGE_WRITE_ERROR}
+
+    def _handle_post(self, path: str, body: dict[str, Any]) -> tuple[int, Any]:
         eng = self.engine
         if path == "/api/heartbeat":
             if self.watch:
@@ -147,6 +173,18 @@ class App:
         if path == "/api/check":
             started = eng.start_check("manual")
             return (202, {"started": True}) if started else (409, {"error": "이미 점검이 진행 중입니다."})
+        if path == "/api/backup":
+            with self._config_lock:
+                if self._closing:
+                    return 503, {"error": "프로그램을 종료 중이므로 DB를 백업할 수 없습니다."}
+                if body:
+                    return 400, {"error": "DB 백업은 지정된 백업 폴더만 사용합니다. 추가 입력 없이 요청하세요."}
+                try:
+                    backup = eng.backup_database()
+                except (sqlite3.Error, OSError):
+                    eng.last_error = STORAGE_WRITE_ERROR
+                    return 503, {"error": "DB 백업을 완료하지 못했습니다. 저장 공간과 파일 권한을 확인하세요. 기존 DB는 유지됩니다."}
+                return 200, {"ok": True, "path": str(backup)}
         if path in ("/api/config", "/api/credentials", "/api/settings"):
             with self._config_lock:
                 if self._closing:
@@ -167,7 +205,17 @@ class App:
                     return 400, {"error": "설정 또는 계정 입력 형식이 올바르지 않습니다. 입력 값을 확인하세요."}
                 except OSError:
                     return 500, {"error": "설정 파일을 저장하지 못했습니다. 기존 설정과 계정을 유지했습니다."}
+                warning = ""
                 if has_config:
+                    reconcile = getattr(eng, "reconcile_inventory", None)
+                    if reconcile:
+                        try:
+                            reconcile(cfg)
+                            if getattr(eng, "last_error", "") == INVENTORY_CLEANUP_WARNING:
+                                eng.last_error = ""
+                        except Exception:
+                            warning = INVENTORY_CLEANUP_WARNING
+                            eng.last_error = warning
                     try:
                         eng.reschedule()
                         if self.on_config_saved:
@@ -175,17 +223,25 @@ class App:
                     except Exception:  # pragma: no cover
                         log.exception("설정 저장 후 처리 실패")
                 payload = {"ok": True, "config": cfg} if has_config else {"ok": True, "note": None}
+                if warning:
+                    payload["warning"] = warning
                 if path != "/api/config":
                     payload["credentials"] = eng.creds.status()
                 return 200, payload
-        if path == "/api/vrrp/ack":
-            # 확인 · 초기화: 미확인 VRRP 변경을 확인 처리하고 그 백본의 VRRP 기준값만 지움 → 다음 점검부터 '역할 변화' 표시 없음
-            devs = eng.store.ack_vrrp(body.get("device") or None)
-            started = bool(body.get("recheck")) and eng.start_check("manual")
-            return 200, {"ok": True, "devices": devs, "recheck": started, "running": eng.running}
-        if path == "/api/baseline/reset":
-            eng.store.reset_baseline(body.get("device") or None)
-            return 200, {"ok": True}
+        if path in ("/api/vrrp/ack", "/api/baseline/reset"):
+            with self._config_lock:
+                if self._closing:
+                    return 503, {"error": "프로그램을 종료 중이므로 기준값을 변경할 수 없습니다."}
+                try:
+                    if path == "/api/vrrp/ack":
+                        devs = eng.store.ack_vrrp(body.get("device") or None)
+                        started = bool(body.get("recheck")) and eng.start_check("manual")
+                        return 200, {"ok": True, "devices": devs, "recheck": started, "running": eng.running}
+                    eng.store.reset_baseline(body.get("device") or None)
+                    return 200, {"ok": True}
+                except (sqlite3.Error, OSError):
+                    eng.last_error = STORAGE_WRITE_ERROR
+                    return 503, {"error": STORAGE_WRITE_ERROR}
         if path == "/api/diagnose":
             from .diagnose import diagnose
             cfg = eng.cfg.get()
@@ -278,30 +334,27 @@ def make_handler(app: App):
                 if ctype.startswith("text/") or ctype.endswith("javascript"):
                     ctype += "; charset=utf-8"
                 return self._send(200, target.read_bytes(), ctype)
-            if url.path == "/report.xlsx":
+            if url.path in ("/report.xlsx", "/report"):
                 if not secrets.compare_digest(q.get("t", ""), app.token):
                     return self._send(403, {"error": "권한 없음"})
-                from urllib.parse import quote
-                from .excel import build_workbook, report_filename
-                run = app.engine.store.get_run(int(q["id"]) if q.get("id") else None)
-                if not run:
-                    return self._send(404, {"error": "점검 기록이 없습니다."})
-                cfg = app.engine.cfg.get()
-                data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                      lambda dev, cmd: app.engine.store.get_raw(run["id"], dev, cmd))
-                name = report_filename(run)
-                return self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                  {"Content-Disposition": f"attachment; filename=\"netcheck.xlsx\"; filename*=UTF-8''{quote(name)}"})
-            if url.path == "/report":
-                if not secrets.compare_digest(q.get("t", ""), app.token):
-                    return self._send(403, {"error": "권한 없음"})
-                run = app.engine.store.get_run(int(q["id"]) if q.get("id") else None)
-                if not run:
-                    return self._send(404, {"error": "점검 기록이 없습니다."})
-                site = app.engine.cfg.get().get("site_name", "")
-                name = time.strftime("netcheck_report_%Y%m%d_%H%M.html", time.localtime(run["started"]))
-                disp = {"Content-Disposition": f'attachment; filename="{name}"'} if q.get("download") else {}
-                return self._send(200, render(run, site), "text/html; charset=utf-8", disp)
+                try:
+                    run = app.engine.store.get_run(int(q["id"]) if q.get("id") else None)
+                    if not run:
+                        return self._send(404, {"error": "점검 기록이 없습니다."})
+                    cfg = app.engine.cfg.get()
+                    if url.path == "/report.xlsx":
+                        from urllib.parse import quote
+                        from .excel import build_workbook, report_filename
+                        data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"],
+                                              lambda dev, cmd: app.engine.store.get_raw(run["id"], dev, cmd))
+                        name = report_filename(run)
+                        return self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                          {"Content-Disposition": f"attachment; filename=\"netcheck.xlsx\"; filename*=UTF-8''{quote(name)}"})
+                    name = time.strftime("netcheck_report_%Y%m%d_%H%M.html", time.localtime(run["started"]))
+                    disp = {"Content-Disposition": f'attachment; filename="{name}"'} if q.get("download") else {}
+                    return self._send(200, render(run, cfg.get("site_name", "")), "text/html; charset=utf-8", disp)
+                except (sqlite3.Error, OSError):
+                    return self._send(503, {"error": STORAGE_READ_ERROR})
             if url.path.startswith("/api/"):
                 if not self._token_ok():
                     return self._send(403, {"error": "화면을 새로고침하세요(세션 만료)."})

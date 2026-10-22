@@ -107,6 +107,19 @@ function fixture() {
   }
   {
     const f = fixture();
+    f.context.api = async (url, body) => {
+      f.calls.push({url, body});
+      return {config: body.config, warning: '설정은 저장했지만 기준값 정리가 필요합니다.'};
+    };
+    await f.context.saveSettings();
+    assert.equal(f.after(), 0, 'storage maintenance warning must not start a check');
+    assert.equal(f.errors.length, 0, 'committed settings must not be reported as a failed save');
+    assert.equal(f.context.S.devDirty, false);
+    assert.match(f.fields['#saveErr'].textContent, /기준값 정리/);
+    assert.match(f.notices[0], /설정은 저장했지만/);
+  }
+  {
+    const f = fixture();
     vm.runInContext(refreshCode, f.context);
     let settingsRendered = 0;
     f.context.renderSettings = () => {settingsRendered++;};
@@ -143,5 +156,29 @@ function fixture() {
     assert.equal(f.clear.disabled, false);
     assert.equal(f.after(), 0);
   }
-  console.log('PASS: settings UI validation, single transaction, duplicate save, real refresh failure, save/clear rollback recovery');
+  {
+    const f = fixture();
+    f.fields['#dbBackup'] = {disabled: false};
+    f.fields['#dbBackupNote'] = {textContent: ''};
+    vm.runInContext(section('  async function backupDatabase()', '  $("#excelBtn").addEventListener'), f.context);
+    let finish;
+    f.context.api = (url, body) => {
+      f.calls.push({url, body});
+      return new Promise(resolve => {finish = resolve;});
+    };
+    const pending = f.context.backupDatabase();
+    await f.context.backupDatabase();
+    assert.equal(f.calls.length, 1, 'a pending backup must not be duplicated');
+    assert.equal(f.calls[0].url, '/api/backup');
+    assert.equal(JSON.stringify(f.calls[0].body), '{}', 'backup must not accept a UI supplied path');
+    finish({ok: true, path: 'synthetic/backups/history.sqlite3'}); await pending;
+    assert.match(f.fields['#dbBackupNote'].textContent, /synthetic\/backups\/history.sqlite3/);
+    assert.equal(f.fields['#dbBackup'].disabled, false);
+    f.context.api = async () => {throw Error('Synthetic backup failure');};
+    await f.context.backupDatabase();
+    assert.match(f.fields['#dbBackupNote'].textContent, /백업 실패/);
+    assert.doesNotMatch(f.fields['#dbBackupNote'].textContent, /저장했습니다/);
+    assert.equal(f.fields['#dbBackup'].disabled, false);
+  }
+  console.log('PASS: settings UI validation, single transaction, duplicate save, real refresh failure, save/clear rollback recovery, storage warnings, managed backup');
 })().catch(error => {console.error(error); process.exitCode = 1;});

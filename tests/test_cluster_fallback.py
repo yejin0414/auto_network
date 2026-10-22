@@ -402,6 +402,9 @@ class ClusterFallback(unittest.TestCase):
     def test_cancelled_regular_job_cannot_overwrite_new_progress(self):
         cfg = validate({"devices": [{"id": "a", "name": "WLC a", "role": "WLC", "host": "192.0.2.11"}]})
         self.engine.cfg = SimpleNamespace(get=lambda: cfg)
+        self.engine.store.baselines.return_value = {}
+        self.engine.store.previous_metrics.return_value = {}
+        self.engine.store.get_run.return_value = None
         self.engine._gen = 1
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
@@ -432,7 +435,7 @@ class ClusterFallback(unittest.TestCase):
         self.assertEqual(outcomes, ["abandoned"])
         self.assertEqual(self.engine.progress, {"a": "new run finished"})
         self.assertEqual(self.driver.opened, [])
-        self.engine.store.save_run.assert_not_called()
+        self.engine.store.commit_run.assert_not_called()
 
 
 class CollectorCancellation(unittest.TestCase):

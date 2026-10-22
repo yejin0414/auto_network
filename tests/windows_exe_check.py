@@ -4,10 +4,14 @@
 GitHub Actions(Windows)에서 실행합니다.
 """
 import json
+import hashlib
+import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +23,7 @@ require_disposable_windows()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.mock_ssh import MockDevice  # noqa: E402
 from tests.test_e2e_ssh import aruba, comware  # noqa: E402
+from nc.store import validate_database  # noqa: E402
 
 EXE = Path(sys.argv[1]).resolve()
 PORT = 8799
@@ -98,6 +103,46 @@ def verify_failed_combined_save(token, config_path):
     print("설정 검증/파일 교체 실패 시 설정·계정 보존 확인")
 
 
+def verify_database_backup_and_cleanup(token, config, run):
+    result = json.loads(req("/api/backup", {}, token))
+    backup = Path(result["path"])
+    assert backup.parent.resolve() == (EXE.parent / "data" / "backups").resolve()
+    validate_database(backup)
+    digest = hashlib.sha256(backup.read_bytes()).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="netcheck-exe-restore-") as directory:
+        restored = Path(directory) / "restored.sqlite3"
+        env = {**os.environ, "NC_NO_DIALOG": "1"}
+        for arguments in (["--verify-db", str(backup)],
+                          ["--restore-db", str(backup), "--restore-to", str(restored)]):
+            completed = subprocess.run([str(EXE), *arguments], cwd=EXE.parent, env=env, timeout=45)
+            assert completed.returncode == 0, "EXE DB 검증/새 파일 복원 실패"
+        validate_database(restored)
+        db = sqlite3.connect(restored)
+        try:
+            assert db.execute("SELECT COUNT(*) FROM runs WHERE id=?", (run["id"],)).fetchone()[0] == 1
+            assert db.execute("SELECT COUNT(*) FROM raw_outputs WHERE run_id=?", (run["id"],)).fetchone()[0] > 0
+            assert db.execute("SELECT COUNT(*) FROM baselines WHERE device_id='bb3'").fetchone()[0] == 1
+            print("Windows 복원 DB SQLite:", sqlite3.sqlite_version)
+        finally:
+            db.close()
+        before = hashlib.sha256(restored.read_bytes()).hexdigest()
+        rejected = subprocess.run([str(EXE), "--restore-db", str(backup), "--restore-to", str(restored)],
+                                  cwd=EXE.parent, env=env, timeout=45)
+        assert rejected.returncode == 1, "기존 DB 덮어쓰기를 거부하지 않음"
+        assert hashlib.sha256(restored.read_bytes()).hexdigest() == before
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == digest
+    removed = json.loads(json.dumps(config))
+    removed["devices"] = [d for d in removed["devices"] if d["id"] != "bb3"]
+    req("/api/settings", {"config": removed, "credentials": []}, token)
+    state = json.loads(req("/api/state", token=token))
+    assert "bb3" not in state["baseline_times"], "삭제한 장비 기준값이 남음"
+    history = json.loads(req(f"/api/run?id={run['id']}", token=token))
+    assert "bb3" in history["devices"], "장비 삭제가 과거 회차를 지움"
+    assert json.loads(req(f"/api/raw?run={run['id']}&device=bb3&cmd=cpu", token=token))["output"]
+    req("/api/settings", {"config": config, "credentials": []}, token)
+    print("Windows EXE 백업·새 파일 복원·덮어쓰기 거부·장비 삭제 기준값 정리/과거 이력 보존 확인")
+
+
 def main():
     bb = MockDevice("<BB-3>", comware({}), legacy=True)  # 오래된 Comware처럼 SHA-1 SSH만 제공
     wlc = MockDevice("(WLC-01) #", aruba("wlc"))
@@ -132,6 +177,7 @@ def main():
             print(d, v["connected"], v["status"], v.get("error"))
             assert v["connected"], f"{d} SSH 접속 실패: {v.get('error')}"
         assert run["devices"]["bb3"]["metrics"]["cpu"] is not None, "CPU 값 없음"
+        verify_database_backup_and_cleanup(tok, cfg, run)
     finally:
         p.kill(); p.wait()
 

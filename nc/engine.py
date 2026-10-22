@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import copy
+import sqlite3
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -65,6 +67,7 @@ class Engine:
         self.driver = driver
         self.demo = demo
         self._lock = threading.Lock()
+        self.persistence_lock = threading.RLock()
         self.running = False
         self.progress: dict[str, str] = {}
         self.run_started: float | None = None
@@ -92,6 +95,14 @@ class Engine:
             "demo": self.demo,
             "now": time.time(),
         }
+
+    def reconcile_inventory(self, cfg: dict | None = None) -> int:
+        with self.persistence_lock:
+            return self.store.sync_inventory(cfg if cfg is not None else self.cfg.get())
+
+    def backup_database(self) -> Path:
+        with self.persistence_lock:
+            return self.store.backup()
 
     # ------------------------------------------------------------- 점검
     def start_check(self, trigger: str = "manual") -> bool:
@@ -124,6 +135,12 @@ class Engine:
             return self._run(trigger, now, gen)
         except _Abandoned:
             log.warning("너무 오래 걸려 중단 처리한 점검이 뒤늦게 끝났습니다(결과는 버림)")
+            return None
+        except (sqlite3.Error, OSError) as exc:
+            log.error("점검 저장 실패: %s", type(exc).__name__)
+            if gen == self._gen:
+                self.last_error = ("점검 데이터를 저장하지 못했습니다. 이번 회차의 결과·기준값·이력은 반영하지 않았습니다. "
+                                   "디스크 여유 공간, DB 파일 권한·잠금 및 백업 상태를 확인하세요.")
             return None
         except Exception as exc:  # pragma: no cover - 방어
             log.exception("점검 실패")
@@ -285,7 +302,22 @@ class Engine:
         return clusters
 
     def _run(self, trigger: str, now: float | None, gen: int = 0) -> int:
-        cfg = self.cfg.get()
+        with self.persistence_lock:
+            cfg = self.cfg.get()
+            revision = self.reconcile_inventory(cfg)
+            baselines = self.store.baselines()
+            previous_metrics = self.store.previous_metrics()
+            prev_run = self.store.get_run()
+            epochs = cfg.get("_baseline_epochs", {})
+            def same_device(key, row):
+                epoch = epochs.get(key)
+                saved = row.get("baseline_epoch")
+                return not epoch or saved == epoch or (saved is None and key in baselines)
+            previous_metrics = {key: row for key, row in previous_metrics.items() if same_device(key, row)}
+            if prev_run:
+                prev_run = copy.deepcopy(prev_run)
+                prev_run["devices"] = {key: row for key, row in prev_run.get("devices", {}).items()
+                                       if same_device(key, row)}
         started = now or time.time()
         hook = getattr(self.driver, "begin_run", None)
         if hook:
@@ -374,21 +406,34 @@ class Engine:
 
         if self._run_cancelled(gen):
             raise _Abandoned()
-        prev_run = self.store.get_run()
-        evaluation, new_base = evaluate_run(cfg, collections, clusters, self.store.baselines(),
-                                            self.store.previous_metrics(), now=started)
+        evaluation, new_base = evaluate_run(cfg, collections, clusters, baselines, previous_metrics, now=started)
+        for key, result in evaluation["devices"].items():
+            if key in epochs:
+                result["baseline_epoch"] = epochs[key]
         finished = time.time() if now is None else started + 40
-        run_id = self.store.save_run(started, finished, trigger, evaluation, collections, clusters,
-                                     report_config=cfg)
-        self.store.save_baselines(new_base)
-        self.store.add_events(self._diff_events(prev_run, evaluation, run_id, started))
-        try:
-            self.store.add_vrrp(self._vrrp_rows(prev_run, evaluation, run_id, started))
-        except Exception:  # pragma: no cover - 이력 기록 실패가 점검을 막지 않도록
-            log.exception("VRRP 이력 기록 실패")
-        self.store.prune(cfg["retention_days"])
+        with self.persistence_lock:
+            if self._run_cancelled(gen):
+                raise _Abandoned()
+            # A deleted/replaced device must not regain the old run's baseline.
+            self.reconcile_inventory()
+            run_id = self.store.commit_run(
+                started, finished, trigger, evaluation, collections, clusters, report_config=cfg,
+                baseline_updates=new_base, expected_revision=revision,
+                events_factory=lambda rid: self._diff_events(prev_run, evaluation, rid, started),
+                vrrp_factory=lambda rid: self._vrrp_rows(prev_run, evaluation, rid, started))
         self.last_error = ""
-        self._after_run(cfg, run_id)
+        try:
+            self.store.backup_if_due()
+            self.store.prune(cfg["retention_days"])
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            log.error("점검 저장 후 백업/보관 정리 실패: %s", type(exc).__name__)
+            self.last_error = ("점검은 저장했습니다. DB 백업 또는 보관 기간 정리를 완료하지 못했습니다. "
+                               "디스크 여유 공간·권한·잠금을 확인하세요. 백업 실패 시 기록 정리를 건너뜁니다.")
+        try:
+            self._after_run(cfg, run_id)
+        except Exception as exc:
+            log.error("점검 저장 후 보고서/알림 처리 실패: %s", type(exc).__name__)
+            self.last_error += " 점검은 저장했으나 보고서·알림 처리를 완료하지 못했습니다."
         return run_id
 
     # ------------------------------------------------------------- 점검 후: 엑셀 저장, 알림
@@ -419,7 +464,7 @@ class Engine:
                 self.last_report = saved
             except Exception as exc:
                 log.warning("엑셀 보고서 저장 실패: %s", exc)
-                self.last_error = f"엑셀 보고서를 저장하지 못했습니다: {type(exc).__name__} {exc}"
+                self.last_error = (self.last_error + " " if self.last_error else "") + f"엑셀 보고서를 저장하지 못했습니다: {type(exc).__name__} {exc}"
         if rep.get("notify"):
             try:
                 from .notify import completion_message, show_toast

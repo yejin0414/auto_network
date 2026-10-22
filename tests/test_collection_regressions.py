@@ -158,7 +158,7 @@ class ReportErrorRegressions(unittest.TestCase):
         store.get_run.side_effect = [None, {"id": 1}]
         store.baselines.return_value = {}
         store.previous_metrics.return_value = {}
-        store.save_run.return_value = 1
+        store.commit_run.return_value = 1
         engine = Engine(SimpleNamespace(get=lambda: cfg), store, None, SimpleNamespace())
         with patch("nc.excel.save_report", side_effect=OSError("mock report write failure")):
             self.assertEqual(engine._run("test", None), 1)

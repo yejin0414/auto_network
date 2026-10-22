@@ -9,6 +9,7 @@ import math
 import re
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,8 @@ def normalize_device(raw: dict[str, Any], index: int) -> dict[str, Any]:
             raise ConfigError(f"{index + 1}번째 장비: '{host}'는 올바른 IP나 호스트명이 아닙니다.")
     name = str(raw.get("name", "")).strip() or host
     dev_id = str(raw.get("id", "")).strip() or re.sub(r"[^a-z0-9]+", "-", f"{role}-{name}".lower()).strip("-")
+    if dev_id[:40] == "__cluster__":
+        raise ConfigError("__cluster__는 내부 기준값에 사용하는 예약 장비 ID입니다.")
     device_type = str(raw.get("device_type") or "").strip().lower()
     if device_type and not re.fullmatch(r"[a-z0-9_]{2,40}", device_type):
         raise ConfigError(f"{index + 1}번째 장비: 장비 종류(device_type) '{device_type}'가 올바르지 않습니다.")
@@ -205,6 +208,13 @@ def validate(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
+def device_identities(cfg: dict) -> dict[str, list]:
+    """Identity changes require a new baseline; display/enable changes do not."""
+    return {d["id"]: [d["host"].casefold(), d["role"], d["port"], d["protocol"],
+                       d.get("device_type", ""), d.get("cluster", "")]
+            for d in cfg["devices"]}
+
+
 class ConfigStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -212,14 +222,26 @@ class ConfigStore:
         self._cfg = self._load()
 
     def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
+        exists = self.path.exists()
+        if not exists:
             example = self.path.with_name("config.example.json")
             raw = json.loads(example.read_text(encoding="utf-8")) if example.exists() else {}
-            cfg = validate(raw)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-            return cfg
-        return validate(json.loads(self.path.read_text(encoding="utf-8-sig")))
+        else:
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        cfg = validate(raw)
+        old = cfg.get("_baseline_epochs")
+        saved = old if isinstance(old, dict) else {}
+        identities = device_identities(cfg)
+        previous = cfg.get("_baseline_identities")
+        epochs = {key: saved[key] if isinstance(saved.get(key), str) and re.fullmatch(r"[0-9a-f]{32}", saved[key])
+                  and isinstance(previous, dict) and previous.get(key) == identity
+                  else uuid.uuid4().hex for key, identity in identities.items()}
+        cfg["_baseline_epochs"] = epochs
+        cfg["_baseline_identities"] = identities
+        if not exists or old != epochs or previous != identities:
+            self._write(cfg)
+        return cfg
 
     def get(self) -> dict[str, Any]:
         with self._lock:
@@ -227,22 +249,33 @@ class ConfigStore:
 
     def save(self, new_cfg: dict[str, Any]) -> dict[str, Any]:
         cfg = validate(new_cfg)
-        text = json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False)
-        result = copy.deepcopy(cfg)
         with self._lock:
-            tmp = None
-            try:
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
-                                                 prefix=self.path.name + ".", suffix=".tmp", delete=False) as file:
-                    tmp = Path(file.name)
-                    file.write(text)
-                tmp.replace(self.path)
-                tmp = None  # The commit succeeded; cleanup cannot undo it.
-            finally:
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except OSError:
-                        pass  # Retain the original write/replace error.
+            before = device_identities(self._cfg)
+            # Ignore client-supplied epochs. Persist deletion/re-addition even
+            # while SQLite is unavailable, so an old baseline cannot revive.
+            cfg["_baseline_epochs"] = {
+                key: self._cfg["_baseline_epochs"][key] if before.get(key) == identity else uuid.uuid4().hex
+                for key, identity in device_identities(cfg).items()
+            }
+            cfg["_baseline_identities"] = device_identities(cfg)
+            result = copy.deepcopy(cfg)
+            self._write(cfg)
             self._cfg = cfg
         return result
+
+    def _write(self, cfg: dict) -> None:
+        text = json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                             prefix=self.path.name + ".", suffix=".tmp", delete=False) as file:
+                tmp = Path(file.name)
+                file.write(text)
+            tmp.replace(self.path)
+            tmp = None  # The commit succeeded; cleanup cannot undo it.
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Retain the original write/replace error.

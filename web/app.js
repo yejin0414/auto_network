@@ -153,6 +153,7 @@
   function renderBar() {
     const st = S.st; if (!st) return;
     renderCredBanner();
+    renderStorageBanner(st);
     $("#siteName").textContent = st.config.site_name || "무선망 통합 점검";
     $("#demoTag").hidden = !st.engine.demo;
     if (st.version) $("#appVer").textContent = `v${st.version}`;
@@ -177,6 +178,17 @@
     if (document.title !== title) { document.title = title; if (DESKTOP) { try { pv()?.set_title(title); } catch { /* 무시 */ } } }
   }
 
+  function renderStorageBanner(st) {
+    const message = st.storage_error || st.engine.last_error || "";
+    let banner = $("#storageBanner");
+    if (!banner && message) {
+      banner = document.createElement("div");
+      banner.id = "storageBanner"; banner.className = "cred-banner";
+      banner.setAttribute("role", "alert"); $("main").prepend(banner);
+    }
+    if (banner) { banner.hidden = !message; banner.textContent = message; }
+  }
+
   function bgNote(st) {
     const sc = st.config.schedule, bg = st.background || {};
     if (bg.pending) return "최신 자동 점검 설정을 Windows 작업에 반영하는 중입니다…";
@@ -196,6 +208,18 @@
       toast(S.st?.windows ? `엑셀 보고서를 열었습니다: ${r.path}` : `엑셀 보고서를 저장했습니다: ${r.path}`);
     } catch (e) { toast(e.message); }
   }
+  async function backupDatabase() {
+    const button = $("#dbBackup"), note = $("#dbBackupNote");
+    if (button.disabled) return;
+    button.disabled = true; note.textContent = "점검 DB를 백업하는 중…";
+    try {
+      const result = await api("/api/backup", {});
+      note.textContent = `DB 백업을 저장했습니다: ${result.path}`;
+    } catch (error) {
+      note.textContent = `백업 실패: ${error.message}`;
+    } finally { button.disabled = false; }
+  }
+
   $("#excelBtn").addEventListener("click", () => openExcel(S.run?.id));
 
   $("#runBtn").addEventListener("click", async () => {
@@ -209,9 +233,9 @@
     const run = S.run;
     if (!run) {
       v.dataset.level = "unknown";
-      $("#verdictState").textContent = "점검 기록 없음";
+      $("#verdictState").textContent = S.st?.storage_error ? "기록 확인 불가" : "점검 기록 없음";
       const hasDev = (S.st?.config?.devices || []).length > 0;
-      $("#verdictLine").textContent = hasDev ? "‘지금 점검’을 누르면 등록된 장비를 한 번에 점검합니다." : "설정 탭에서 장비와 계정을 먼저 등록하세요.";
+      $("#verdictLine").textContent = S.st?.storage_error || (hasDev ? "‘지금 점검’을 누르면 등록된 장비를 한 번에 점검합니다." : "설정 탭에서 장비와 계정을 먼저 등록하세요.");
       $("#verdictStats").innerHTML = ""; $("#verdictMeta").textContent = "";
       return;
     }
@@ -676,6 +700,9 @@
         <div class="actions" style="justify-content:flex-start">
           <button class="btn small" id="rOpen">보고서 폴더 열기</button>
           <button class="btn small" id="rTest">알림 테스트</button><span class="note" id="rNote"></span></div>
+        <div class="actions" style="justify-content:flex-start">
+          <button class="btn small" id="dbBackup">점검 DB 백업</button><span class="note" id="dbBackupNote"></span></div>
+        <p class="note">점검 이력·원본 출력·기준값을 기본 백업 폴더의 별도 DB 파일로 저장합니다. 접속 계정과 설정 파일은 포함되지 않습니다. 복원은 프로그램을 종료한 뒤 진행하세요.</p>
         <p class="note">엑셀 시트: 요약 · 백본 CPU·메모리(Last 5 sec / 1 min / 5 min, Free) · 컨트롤러 CPU·메모리(user / system / used) · 백본 로그 · 백본 VRRP · 점검 항목 · 원본 출력.
           파일 이름은 무선망점검_날짜_시각_run회차.xlsx이며 점검 기록 보관 기간이 지나면 지웁니다.</p></div>
 
@@ -800,6 +827,7 @@
       try { await api("/api/baseline/reset", {}); toast("다음 점검 결과를 새 기준값으로 저장합니다."); await refreshState(); renderSettings(); } catch (err) { toast(err.message); }
     });
     $("#saveCfg").addEventListener("click", saveSettings);
+    $("#dbBackup").addEventListener("click", backupDatabase);
     $("#rOpen").addEventListener("click", async () => { try { const r = await api("/api/open_reports", {}); $("#rNote").textContent = r.path; } catch (e) { toast(e.message); } });
     $("#rTest").addEventListener("click", async () => {
       $("#rNote").textContent = "알림을 보내는 중…";
@@ -964,10 +992,13 @@
     const ds = res.config.devices, cnt = (r) => ds.filter((d) => d.role === r).length;
     const summary = `장비 ${ds.length}대(백본 ${cnt("BB")} · MM ${cnt("MM")} · WLC ${cnt("WLC")})와 설정을 저장했습니다.`;
     try {
-      if (cr.check) { await afterCredentialsSaved(cr); renderAll(); }
+      if (res.warning) {
+        await refreshState(true); renderAll(); renderSettings();
+        $("#saveErr").textContent = res.warning; toast(res.warning);
+      } else if (cr.check) { await afterCredentialsSaved(cr); renderAll(); }
       else { await refreshState(true); renderAll(); renderSettings(); toast(summary + " 다음 점검부터 적용됩니다."); }
     } catch {
-      toast("계정과 설정은 저장했습니다. 상태를 확인하려면 화면을 새로고침하세요.");
+      toast(res.warning || "계정과 설정은 저장했습니다. 상태를 확인하려면 화면을 새로고침하세요.");
     } finally {
       S.savingSettings = false; buttons.forEach((button) => { button.disabled = false; });
     }

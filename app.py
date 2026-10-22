@@ -12,6 +12,7 @@ import json
 import logging
 import mimetypes
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -52,9 +53,38 @@ def main() -> int:
     ap.add_argument("--check-once", action="store_true", help="한 번 점검하고 결과만 출력한 뒤 종료")
     ap.add_argument("--auto-check", action="store_true",
                     help="(Windows 작업 스케줄러용) 창 없이 1회 점검 → 엑셀 저장 → 알림. 프로그램 창이 켜져 있으면 그쪽이 점검하므로 바로 종료")
+    maintenance = ap.add_mutually_exclusive_group()
+    maintenance.add_argument("--restore-db", type=Path, help="백업 DB를 검증해 새 파일로 복원(장비 접속 없음)")
+    maintenance.add_argument("--verify-db", type=Path, help="DB 무결성과 Netcheck 스키마만 검증(장비 접속 없음)")
+    ap.add_argument("--restore-to", type=Path, help="복원할 새 DB 경로(기존 파일 덮어쓰기 금지)")
     args = ap.parse_args()
     if sys.stdout is None:  # pythonw / 창 없는 실행
         sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+    if args.restore_to and not args.restore_db:
+        ap.error("--restore-to는 --restore-db와 함께 사용하세요.")
+    if args.restore_db or args.verify_db:
+        if args.restore_db and not args.restore_to:
+            ap.error("--restore-db에는 새 경로 --restore-to가 필요합니다.")
+        # Maintenance exits before config, credentials, driver or scheduler setup.
+        from nc.db_maintenance import restore_database
+        from nc.store import validate_database
+        try:
+            if args.restore_db:
+                path = restore_database(args.restore_db, args.restore_to)
+                message = f"DB 복원 완료: {path} (기존 DB는 변경하지 않았습니다)"
+            else:
+                validate_database(args.verify_db)
+                message = "DB 무결성 및 Netcheck 스키마 검증 완료"
+        except (OSError, ValueError, sqlite3.Error):
+            message = "DB 검증/복원 실패: 백업 무결성, 새 대상 경로, 디스크 공간·권한·잠금을 확인하세요."
+            print(message, file=sys.stderr)
+            message_box(message)
+            return 1
+        print(message)
+        if getattr(sys, "frozen", False):
+            message_box(message)
+        return 0
 
     res_dir, run_dir = base_dirs()
     data_dir = run_dir / ("data-demo" if args.demo else "data")
