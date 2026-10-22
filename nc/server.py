@@ -285,6 +285,12 @@ def _open_path(p) -> None:
 def make_handler(app: App):
     allowed_hosts = None
 
+    def _token_matches(value: str) -> bool:
+        try:
+            return secrets.compare_digest(value, app.token)
+        except TypeError:
+            return False
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "AutoNetwork.NetcheckCenter"
 
@@ -314,7 +320,7 @@ def make_handler(app: App):
             self.wfile.write(data)
 
         def _token_ok(self) -> bool:
-            return secrets.compare_digest(self.headers.get("X-NC-Token", ""), app.token)
+            return _token_matches(self.headers.get("X-NC-Token", ""))
 
         def do_GET(self) -> None:
             if not self._host_ok():
@@ -337,14 +343,20 @@ def make_handler(app: App):
                     ctype += "; charset=utf-8"
                 return self._send(200, target.read_bytes(), ctype)
             if url.path in ("/report.xlsx", "/report"):
-                if not secrets.compare_digest(q.get("t", ""), app.token):
+                if not _token_matches(q.get("t", "")):
                     return self._send(403, {"error": "권한 없음"})
                 try:
                     rid = int(q["id"]) if q.get("id") else None
-                    if url.path == "/report.xlsx":
-                        run, raw = app.engine.store.get_report_snapshot(rid)
-                    else:
-                        run = app.engine.store.get_run(rid)
+                except (KeyError, ValueError) as exc:
+                    return self._send(400, {"error": f"요청 값 오류: {exc}"})
+                try:
+                    try:
+                        if url.path == "/report.xlsx":
+                            run, raw = app.engine.store.get_report_snapshot(rid)
+                        else:
+                            run = app.engine.store.get_run(rid)
+                    except OverflowError as exc:
+                        return self._send(400, {"error": f"요청 값 오류: {exc}"})
                     if not run:
                         return self._send(404, {"error": "점검 기록이 없습니다."})
                     cfg = app.engine.cfg.get()
@@ -374,7 +386,7 @@ def make_handler(app: App):
             url0 = urlparse(self.path)
             if url0.path == "/api/bye":  # 창을 닫을 때 화면이 보내는 신호(sendBeacon은 헤더를 못 붙여 주소에 토큰)
                 q0 = {k: v[0] for k, v in parse_qs(url0.query).items()}
-                if self._host_ok() and secrets.compare_digest(q0.get("t", ""), app.token) and app.watch:
+                if self._host_ok() and _token_matches(q0.get("t", "")) and app.watch:
                     app.watch.bye()
                 return self._send(204, b"", "text/plain")
             if not self._host_ok() or not self._token_ok():
