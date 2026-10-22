@@ -1,6 +1,6 @@
 # Netcheck Center 안정성 개선 진행 기록
 
-> **현재 상태 — S-09 재검증 진행 중:** 추가 Actions 39862467484의 반복 스케줄 실패를 계기로 최종 검증을 다시 열었다. 사용자의 계속 진행 승인에 따라 고정 8초 테스트의 실패 메커니즘을 제어된 Demo로 재현하고, 제품 코드를 유지한 채 해당 테스트의 저장 완료 확인·스레드/DB 정리·진단을 보강했다. 변경 테스트의 실제 Windows Actions 전체 성공 전까지 완료 8개, **95.0%**를 유지한다. 아래 과거 완료·실패 기록은 보존하고 현재 판정은 이 상단과 마지막 재검증 실행 기록을 우선한다.
+> **현재 상태 — S-09 재검증 진행 중:** 반복 스케줄 테스트 보강 Commit `4ad89ed`의 Actions 39866316716에서 해당 스케줄 테스트는 통과했지만, 기존 보고서 테스트의 OUT Client 정상 가정이 실패했다. 야간 Demo의 허용 범위 데이터로 같은 assertion 실패를 재현하고, 제품 코드를 유지한 채 보고서 fixture를 실행 당일 낮 시각으로 고정했다. 의도된 IN 저분배 경고 검증도 추가했다. 변경 테스트의 실제 Windows Actions 전체 성공 전까지 완료 8개, **95.0%**를 유지한다. 아래 과거 완료·실패 기록은 보존하며 현재 판정은 이 상단과 마지막 재검증 기록을 우선한다.
 
 ## 작업 기준과 승인 범위
 
@@ -40,7 +40,7 @@
 | S-06 | UI 이력 응답 역전 및 일시 조회 실패 복구 | Medium | 10% | 완료 | Actions 39810972763 전체 성공, Node UI15개/기존 설정/Python381개/EXE 검증 통과 |
 | S-07 | Excel 제목/부제의 제어 문자 방어 | Medium | 5% | 완료 | Actions 39814068606 전체 성공, 신규 Excel6개/Python387개/EXE 검증 통과 |
 | S-08 | 비정상 보고서 ID/토큰 예외 처리 | Low | 5% | 완료 | Actions 39818540896 전체 성공, 신규 HTTP11개/Python398개/EXE 검증 통과 |
-| S-09 | 최종 기능 보존 및 Windows 실행 검증 | Low | 5% | 진행 중 | 39862467484 실패 메커니즘을 제어된 Demo로 재현; 테스트만 최소 보강, 관련 로컬 45개 및 최종 단일 테스트 PASS; 변경 테스트 Windows CI 대기 |
+| S-09 | 최종 기능 보존 및 Windows 실행 검증 | Low | 5% | 진행 중 | 39866316716에서 반복 스케줄 개별 PASS/보고서 테스트 FAIL; 야간 Demo 실패 재현, 보고서 fixture만 보강, 관련 로컬 32개 PASS; 변경 테스트 전체 Windows CI 대기 |
 
 가중치 변경 내역: 없음. 최신 추가 CI 실패로 다시 연 S-09만 진행 중이며 실제 변경 테스트의 전체 Windows CI 성공 전까지 5%를 집계하지 않는다. 기존 이전/개선 작업은 이 계획의 완료 가중치로 다시 계산하지 않는다.
 
@@ -675,3 +675,33 @@ FAILED (failures=1, skipped=4)
 - 독립 검토의 Windows cleanup 진단 보완을 반영했다. 최종 테스트 blob은 `a525031a501a05e3349e3e27fb55c1e940ca8700`이다. 마지막 보완 후 해당 실제 반복 테스트를 다시 실행해 **1개 / 6.017초 / OK**를 확인했고 최종 독립 review도 PASS였다.
 - 위 45개·양성/음성 관찰은 cleanup 옵션 보완 전 테스트 blob `8107c4581ed58ed9e50dab30a5feceea626df95a`에서 수행했다. 마지막 차이는 실패 경로의 임시 경로 정리 예외 보존 옵션 한 줄이며 최종 blob의 단일 테스트 및 전체 Windows CI와 구분한다.
 - 로컬 검증만으로 완료 처리하지 않는다. **현재 S-09 진행 중, 완료 8개, 전체 95.0%, 증가 +0.0%p**다. 실제 변경 Commit의 전체 GitHub Actions가 성공한 뒤 완료 조건과 기능 보존을 대조한다.
+
+
+## S-09 재검증 실행 — 보고서 Demo fixture의 실행 시각 의존성
+
+### 실제 추가 CI와 실패 범위
+
+- 반복 스케줄 테스트 보강 Commit [4ad89eddef849e4054a4ef980f99a166c8551a53](https://github.com/yejin0414/auto_network/commit/4ad89eddef849e4054a4ef980f99a166c8551a53), Tree `0a8fd7f42858b3c6e4bed4322ab9a19204086563`의 [Actions 39866316716](https://github.com/yejin0414/auto_network/actions/runs/39866316716) / [Job 120129280641](https://github.com/yejin0414/auto_network/actions/runs/39866316716/job/120129280641)은 `completed/failure`다. 실제 전체 로그 123,677자와 정확한 head를 확인했다.
+- 결과는 **420개 / 184.397초 / FAILED(failures=1, skipped=4)**다. 유일한 실패는 `tests.test_report_window.ExcelReport.test_two_clusters_separate`의 기존 OUT Client warn 부재 assertion이며 `AssertionError: True is not false`가 발생했다.
+- 보강한 `test_runs_repeatedly`는 개별 **ok**였고 숫자 회귀 22개/HTTP 입력 11개도 모두 개별 ok였다. 공개 소스 123개, Node history 15개/기존 settings는 PASS다. 선행 Python 실패로 DB 규모/EXE/Windows 단계는 미실행이며 전체 성공으로 집계하지 않는다.
+- Windows Python 3.12.10/SQLite 3.49.1, Node v22.23.3, runner 이미지 20261007.264.1이다. 29개 Python 패키지 버전은 앞선 성공과 같다. 실패 로그에는 당시 OUT의 실제 Active 값이 없으므로 실행 환경 차이나 난수만으로 해당 원인을 단정하지 않는다.
+- [Windows-validation-logs](https://github.com/yejin0414/auto_network/actions/runs/39866316716/artifacts/12464381789)만 생성됐으며 배포 ZIP은 생성되지 않았다. PR #8은 open/Draft/미병합, main은 최초 기준 그대로임을 다시 확인했다.
+
+### 재현 근거와 최소 수정
+
+- 기존 fixture는 실제 시각의 Demo로 27회 점검한 뒤 OUT에서 Client warn이 전혀 없기를 요구했다. Demo의 야간 factor는 0.12이므로 OUT Active는 `int(160 * 0.12 + randint(-15, 15))`, 즉 4~34명이다. 기존 기준은 클러스터 총 50명 이상일 때 같은 클러스터 다른 장비 중앙값의 25% 미만을 warn으로 표시한다.
+- 임시 SQLite와 실제 Demo/Engine/평가를 사용하고 소켓 연결을 금지한 두 조건, 총 54회 저장 실험을 수행했다. 야간 조건에서 제품이 허용하는 난수 결과를 제어해 OUT **[4, 34, 34, 34]**를 생성했다. 합계 106명, 다른 OUT 중앙값 34명의 25%인 8.5명보다 4명이 작아 기존 판정대로 warn이 발생했고 **동일한 기존 OUT assertion 실패**를 재현했다. 27회 모두 저장됐고 last_error는 비어 있었다.
+- 낮 조건의 마지막 OUT은 **[164, 150, 155, 151]**, 모두 ok였으며 IN wlc3는 **32명/다른 IN 중앙값 399명**으로 warn이었다. 27회 모두 저장되고 테스트가 통과했다. 두 조건의 동일 입력을 수정 전과 현재 평가 함수에 각각 적용한 54개 반환 결과도 모두 같았다.
+- 이는 제품 판정 오류 없이 테스트 전제가 깨지는 메커니즘을 입증한다. **실제 Windows 실패 당시의 난수 순서/정확한 분배값을 복원한 것은 아니다.** 제품의 정상 주의 표시를 제거하거나 임계값을 완화하지 않는다.
+- 수정 파일은 `tests/test_report_window.py`와 이 기록뿐이다. 기존 `Engine.run_blocking(now=...)` 인자에 **실행 당일의 로컬 13:00부터 1분 간격** 시각을 주입한다. 27회 실제 수집/평가/DB 저장/보고서 생성 및 BB3 장애 시나리오는 그대로다.
+- 절대 과거 날짜를 고정하면 실제 시각 기준의 이력 보관 정리로 미래 CI에서 fixture가 삭제될 수 있으므로 실행 당일을 사용한다. 전역 시계나 제품 timeout/보존 정책을 바꾸지 않는다.
+- 13:00~13:26의 factor는 0.9958428249693113~1.0이며, 가능한 모든 OUT Active는 144~175명이다. 최소 144가 다른 OUT의 최대 중앙값 175의 25%(43.75)보다 크므로 허용 난수 순서와 무관하게 OUT 정상 조건이 유지된다. 마지막 4회 IN의 정상 peer는 최소 393, wlc3는 최대 33이므로 기존 저분배 경고도 유지된다.
+- 기존 OUT 정상/클러스터 연결/요약/합계/보고서 assertions를 모두 보존하고 IN wlc3의 clients=warn assertion을 추가했다. 모든 Client 경고를 없애는 잘못된 수정은 통과할 수 없다. 기본 25%와 현재 fixture만으로 모든 클러스터 혼합 오류를 검출한다고 주장하지는 않는다.
+
+### 변경 후 검증과 현재 상태
+
+- `python -m unittest tests.test_report_window tests.test_excel_text_safety tests.test_report_snapshots -v`: **32개 / 8.386초 / OK**. Python 3.12.14 로컬에서 기존 보고서 시트/셀/형식, 완료 알림 문구, 창 종료 판단, Excel 제어 문자, 과거 보고서 context/DB 호환성을 확인했다.
+- 최종 테스트 blob은 `7df95a72693cfab5c3fa3fce0a1496ddfcc7f25b`이며 독립 Diff review PASS다. 변경은 datetime import, 당일 낮 시간 주입, 실제 IN warn assertion의 3개 hunk다.
+- 진행 문서 수정 전 로컬 121개 text blob을 기준 head와 대조해 보고서 테스트 하나만 달라지고 120개가 같음을 확인했다. 원격 아이콘 2개를 포함한 나머지 blob은 base tree에서 보존한다. 제품/장비 명령/판정/임계값/UI/API/보고서 형식/설정/DB/스케줄/workflow/패키지는 이번 보강에서 변경하지 않는다.
+- **S-09 진행 중, 완료 8개, 전체 95.0%, 증가 +0.0%p**를 유지한다. 기존 스케줄 테스트 보강을 포함한 실제 새 Commit의 전체 Windows Actions 성공과 최종 기록 대조 후에만 S-09의 5%를 복구한다.
+- 작업 수 9개와 가중치 100%는 그대로이며 새 작업을 추가하지 않았다. 일반 `/api/run` 범위 밖 ID 예외는 승인 범위 밖 후속 후보로 남긴다.
