@@ -37,6 +37,7 @@ def comware(state):
             "display vrrp": "              ^\n % Unrecognized command found at '^' position.",
             "show vrrp": r("comware_vrrp.txt"),
         }
+        table.update(state.get("command_outputs", {}))
         return strip_prompt(table.get(cmd, "              ^\n % Unrecognized command found at '^' position."))
     return resp
 
@@ -150,6 +151,41 @@ class EndToEnd(unittest.TestCase):
         c = run["devices"]["bb3"]["checks"][0]
         self.assertEqual(c["level"], "unknown")
         self.assertIn("로그인 실패", c["summary"])
+
+    def test_7506_documented_outputs_collect_evaluate_and_preserve_raw(self):
+        from tests.test_7506_hardware import DEVICE, POWER
+
+        def fixture(name):
+            return "\n".join(r(name).splitlines()[1:])
+
+        outputs = {"display device": DEVICE, "display power": POWER,
+                   "display ospf peer": fixture("comware_7506_ospf.txt")}
+        self.state["command_outputs"] = outputs
+        run_id = self.engine.run_blocking("manual")
+        first = self.store.get_run(run_id)
+        checks = {c["key"]: c for c in first["devices"]["bb3"]["checks"]}
+        for key, cmd in (("device", "display device"), ("power", "display power"), ("ospf", "display ospf peer")):
+            self.assertEqual(checks[key]["level"], "ok")
+            self.assertEqual(checks[key]["command"], cmd)
+            self.assertIn(cmd, self.bb.received)
+            self.assertEqual(self.store.get_raw(run_id, "bb3", key)["output"].strip(), outputs[cmd].strip())
+        baseline = self.store.baselines()["bb3"]
+        self.assertEqual(baseline["slots"], ["0", "1"])
+        self.assertEqual(set(baseline["power_states"]), {"1/1", "1/2", "2/1", "2/2"})
+        self.assertEqual(baseline["ospf"], ["203.0.113.11", "203.0.113.12"])
+
+        # The original S7500 default uses a detailed response to this SAME
+        # command. Truncated hardware must not reset established baselines.
+        outputs["display ospf peer"] = fixture("comware_7506_ospf_detail.txt")
+        outputs["display device"] += "\n3 SYNTHETIC-LPU"
+        outputs["display power"] += "\nChassis 3:"
+        second_id = self.engine.run_blocking("manual")
+        second = self.store.get_run(second_id)
+        checks = {c["key"]: c for c in second["devices"]["bb3"]["checks"]}
+        self.assertEqual(checks["ospf"]["level"], "ok")
+        self.assertEqual(checks["device"]["level"], "unknown")
+        self.assertEqual(checks["power"]["level"], "unknown")
+        self.assertEqual(self.store.baselines()["bb3"], baseline)
 
 
 if __name__ == "__main__":
