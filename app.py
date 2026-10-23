@@ -28,7 +28,7 @@ from nc.engine import Engine
 from nc.server import App, serve
 from nc.store import Store
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 # 자동 검사(CI)에서 '이전 버전' 역할을 흉내 낼 때만 사용
 if __import__("os").environ.get("NC_VERSION_OVERRIDE"):
     VERSION = __import__("os").environ["NC_VERSION_OVERRIDE"]

@@ -145,6 +145,25 @@ class EndToEnd(unittest.TestCase):
         bad = [c for c in sent if not c.startswith(("show", "display", "screen-length", "no paging", "quit", "exit", "logout"))]
         self.assertEqual(bad, [], f"조회 외 명령 전송: {bad}")
 
+    def test_7506_extended_formats_through_ssh_and_storage(self):
+        from tests.test_7506_hardware import OLD_DEVICE
+
+        # Synthetic compatibility case, not a claim that S7500E's plain
+        # command returns its documented verbose response on real hardware.
+        detail = r("comware_7506_ospf_extended_detail.txt")
+        detail = "\n".join(line for line in detail.splitlines() if "display ospf" not in line)
+        outputs = {"display device": OLD_DEVICE, "display ospf peer": detail}
+        self.state["command_outputs"] = outputs
+        run_id = self.engine.run_blocking("manual")
+        device = self.store.get_run(run_id)["devices"]["bb3"]
+        checks = {c["key"]: c for c in device["checks"]}
+        for key, command in (("device", "display device"), ("ospf", "display ospf peer")):
+            self.assertEqual(checks[key]["level"], "ok")
+            self.assertEqual(checks[key]["command"], command)
+            self.assertEqual(self.store.get_raw(run_id, "bb3", key)["output"].strip(), outputs[command].strip())
+        self.assertEqual(self.store.baselines()["bb3"]["slots"], ["1", "2"])
+        self.assertEqual(self.store.baselines()["bb3"]["ospf"], ["203.0.113.11", "203.0.113.12"])
+
     def test_wrong_password_not_retried(self):
         self.creds.set("backbone", Credential("op", "WRONG"), False)
         run = self.store.get_run(self.engine.run_blocking("manual"))

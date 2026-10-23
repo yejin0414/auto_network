@@ -626,7 +626,7 @@ def parse_device_slots(text: str) -> list[dict[str, str]]:
             items.append({"slot": f"{m.group(1)}/{m.group(2)}", "type": m.group(3),
                           "state": m.group(4).capitalize(), "line": line.strip()})
             continue
-        m = re.match(r"^\s*(\d+)\s+(\S+)\s+(Master|Standby|Slave|Normal|Fault|Absent|Abnormal|Offline|Faulty)(?=\s|$)", line, re.I)
+        m = re.match(r"^\s*(\d+(?:/\d+)?)\s+(\S+)\s+(Master|Standby|Slave|Normal|Fault|Absent|Abnormal|Offline|Faulty)(?=\s|$)", line, re.I)
         if m:
             items.append({"slot": m.group(1), "type": m.group(2), "state": m.group(3).capitalize(), "line": line.strip()})
             continue
@@ -637,14 +637,35 @@ def parse_device_slots(text: str) -> list[dict[str, str]]:
 
 
 def _device_table_header(line: str) -> tuple[str, int] | None:
-    """Documented S7500E headers and their complete data-row widths."""
-    if re.fullmatch(r"Slot\s+No\.\s+Brd\s+Type\s+Brd\s+Status\s+Subslot\s+Num\s+Sft\s+Ver(?:\s+Patch\s+Ver)?", line, re.I):
+    """Documented S7500/S7500E headers and their complete data-row widths."""
+    if re.fullmatch(r"Slot\s+No\.\s+Brd\s+Type\s+Brd\s+Status\s+Subslot(?:\s+Num)?\s+Sft\s+Ver(?:\s+Patch\s+Ver)?", line, re.I):
         return "standalone", 6 if re.search(r"\bPatch\s+Ver$", line, re.I) else 5
     if re.fullmatch(r"Chassis\s+Slot\s+Type\s+State\s+Subslot\s+Soft\s+Ver(?:\s+Patch\s+Ver)?", line, re.I):
         return "irf", 7 if re.search(r"\bPatch\s+Ver$", line, re.I) else 6
-    if re.fullmatch(r"Slot\s+Type\s+State(?:\s+.*)?", line, re.I):
+    if re.fullmatch(r"Slot\s+Type\s+State\s+Subslot\s+Soft\s+Ver(?:\s+Patch\s+Ver)?", line, re.I):
+        return "slot", 6 if re.search(r"\bPatch\s+Ver$", line, re.I) else 5
+    if re.fullmatch(r"Slot\s+Type\s+State", line, re.I):
         return "legacy", 0
     return None
+
+
+def _device_strip_model_banner(lines: list[str]) -> list[str] | None:
+    """Original S7500 models/engines have a banner before the complete table."""
+    banners = [i for i, line in enumerate(lines)
+               if re.fullmatch(r"H3C\s+(?:S7503|S7506R?)\s+Salience\s+III(?:\s+(?:Plus|Edge))?", line, re.I)]
+    if not banners:
+        return lines
+    if banners != [0] or len(lines) < 2 or _device_table_header(lines[1]) != ("standalone", 6):
+        return None
+    return lines[1:]
+
+
+def _device_row_layout(line: str) -> str:
+    if re.match(r"\d+/\d+(?=\s)", line):
+        return "slash"
+    if re.match(r"\d+\s+\d+(?=\s)", line):
+        return "chassis"
+    return "slot"
 
 
 def _device_snapshot_row(line: str, header: tuple[str, int] | None) -> list[dict[str, str]]:
@@ -653,16 +674,27 @@ def _device_snapshot_row(line: str, header: tuple[str, int] | None) -> list[dict
         return []
     irf = "/" in rows[0]["slot"]
     tokens = line.split()
+    separate_chassis = _device_row_layout(line) == "chassis"
     if header and header[0] == "legacy" and irf:
         return []
     if header and header[0] != "legacy":
-        if (irf != (header[0] == "irf") or len(tokens) != header[1] or
-                to_int(tokens[4 if irf else 3]) is None):
+        if (len(tokens) != header[1] or
+                (header[0] == "irf" and not separate_chassis) or
+                (header[0] == "standalone" and irf) or
+                (header[0] == "slot" and separate_chassis)):
+            return []
+        # Release 3100 uses an Absent marker instead of a subslot count only
+        # for an empty standalone slot, with no board/software/patch present.
+        absent_subslot = (header[0] == "standalone" and not irf and len(tokens) == 6 and
+                          [token.casefold() for token in tokens[1:]] ==
+                          ["none", "absent", "absent", "none", "none"])
+        if to_int(tokens[4 if separate_chassis else 3]) is None and not absent_subslot:
             return []
     elif irf:
         # IRF rows need their documented trailing columns even when used as
         # partial fault evidence without a surrounding table header.
-        if len(tokens) not in (6, 7) or to_int(tokens[4]) is None:
+        widths, subslot_index = ((6, 7), 4) if separate_chassis else ((5, 6), 3)
+        if len(tokens) not in widths or to_int(tokens[subslot_index]) is None:
             return []
     return rows
 
@@ -708,11 +740,14 @@ def parse_device_slots_snapshot(text: str) -> list[dict[str, str]] | None:
     lines = _snapshot_lines(text, "display device")
     if lines is None:
         return None
+    lines = _device_strip_model_banner(lines)
+    if lines is None:
+        return None
     counted = _snapshot_count(lines, r"Total(?: number of)? slots?\s*:\s*(\d+)\.?", r"No slots?(?: configured)?\.?")
     if counted is None:
         return None
     lines, total = counted
-    items, header, awaiting_row = [], None, False
+    items, header, awaiting_row, layout = [], None, False, None
     for line in lines:
         next_header = _device_table_header(line)
         if next_header:
@@ -724,8 +759,10 @@ def parse_device_slots_snapshot(text: str) -> list[dict[str, str]] | None:
         rows = _device_snapshot_row(line, header)
         if len(rows) != 1:
             return None
-        if items and ("/" in items[0]["slot"]) != ("/" in rows[0]["slot"]):
+        row_layout = _device_row_layout(line)
+        if layout is not None and layout != row_layout:
             return None
+        layout = row_layout
         items.extend(rows)
         awaiting_row = False
     ids = [row["slot"] for row in items]
@@ -836,46 +873,57 @@ def _ospf_is_detailed(lines: list[str]) -> bool:
 
 
 def _ospf_detailed_rows(lines: list[str]) -> tuple[list[dict[str, str]], bool]:
-    """Original S7500 default peer output, with complete record boundaries.
+    """S7500 detailed peer records, with complete record boundaries.
 
     Return completed records and whether every line/section was understood.
     The former may retain explicit faults, but only the latter can update a
     baseline or prove a missing neighbor. Ambiguous identities discard both.
+    Also recognize documented S7500E verbose field variants; this does not
+    change which command is collected or imply they are the default there.
     """
     peers, seen = [], set()
     process, area, interface = "", "", ""
     current, stage, section_rows, process_rows = None, 0, None, None
     complete, ambiguous = True, False
+    heading_pending, metadata = False, set()
 
     def finish():
-        nonlocal current, stage, complete
+        nonlocal current, stage, complete, metadata
         if current is not None:
             if stage == 5:
                 peers.append(current)
             else:
                 complete = False
-        current, stage = None, 0
+        current, stage, metadata = None, 0, set()
 
     for line in lines:
         if re.match(r"OSPF\s+Process\b", line, re.I):
             finish()
-            if section_rows == 0 or process_rows == 0:
+            if section_rows == 0 or process_rows == 0 or heading_pending:
                 complete = False
             match = re.fullmatch(r"OSPF\s+Process\s+(\d+)\s+with\s+Router\s+ID\s+(\S+)", line, re.I)
             process, area, interface, section_rows, process_rows = "", "", "", None, 0
+            heading_pending = False
             if not match or valid_ip(match[2]) != match[2]:
                 complete = False
             else:
                 process = match[1]
             continue
-        if re.fullmatch(r"Neighbors?", line, re.I) and current is None:
+        if re.fullmatch(r"Neighbors?", line, re.I):
+            finish()
+            if not process or section_rows == 0 or heading_pending:
+                complete = False
+            # Some releases repeat this heading before the next Area. Do not
+            # allow a trailing heading to inherit the previous area's peers.
+            area, interface, section_rows, heading_pending = "", "", None, True
             continue
         if re.match(r"Area\b", line, re.I):
             finish()
             if section_rows == 0:
                 complete = False
-            match = re.fullmatch(r"Area\s+(\S+)\s+interface\s+([\d.]+)\(([A-Za-z][\w./:-]*\d[\w./:-]*)\)'s\s+neighbor(?:s|\(s\))?", line, re.I)
+            match = re.fullmatch(r"Area\s+(\S+)\s+interface\s+([\d.]+)\s*\(\s*([A-Za-z][\w./:-]*\d[\w./:-]*)\s*\)'s\s+neighbor(?:s|\(s\))?", line, re.I)
             area, interface, section_rows = "", "", 0
+            heading_pending = False
             if not process or not match or any(valid_ip(match[i]) != match[i] for i in (1, 2)):
                 complete = False
             else:
@@ -889,7 +937,8 @@ def _ospf_detailed_rows(lines: list[str]) -> tuple[list[dict[str, str]], bool]:
                 if identity in seen:
                     ambiguous = True
                 seen.add(identity)
-            match = re.fullmatch(r"Router\s*ID\s*:\s*(\S+)\s+Address\s*:\s*(\S+)", line, re.I)
+            match = re.fullmatch(r"Router\s*ID\s*:\s*(\S+)\s+Address\s*:\s*(\S+)"
+                                 r"(?:\s+GR\s+State\s*:\s*(?:Normal|Restarter|Complete|Helper))?", line, re.I)
             if not area or not interface or not match or any(valid_ip(match[i]) != match[i] for i in (1, 2)):
                 complete = False
                 continue
@@ -903,29 +952,44 @@ def _ospf_detailed_rows(lines: list[str]) -> tuple[list[dict[str, str]], bool]:
             complete = False
             continue
         if stage == 1:
-            match = re.fullmatch(r"State\s*:\s*(\S+)\s+Mode\s*:\s*(?:Nbr\s+is\s+(?:Master|Slave)|None)\s+Priority\s*:\s*\d+", line, re.I)
+            match = re.fullmatch(r"State\s*:\s*(\S+)\s+Mode\s*:\s*(?:Nbr\s+is\s+(?:Master|Slave)|None|Null|Hold)\s+Priority\s*:\s*\d+", line, re.I)
             if match and OSPF_STATE_RE.fullmatch(match[1]):
                 current["state"] = match[1]
                 current["line"] += " | " + line
                 stage = 2
                 continue
         elif stage == 2:
-            match = re.fullmatch(r"DR\s*:\s*(\S+)\s+BDR\s*:\s*(\S+)", line, re.I)
-            if match and all(valid_ip(match[i]) == match[i] for i in (1, 2)):
+            match = re.fullmatch(r"DR\s*:\s*(\S+)\s+BDR\s*:\s*(\S+)(?:\s+MTU\s*:\s*\d+)?", line, re.I)
+            if match and all(match[i].lower() == "none" or valid_ip(match[i]) == match[i] for i in (1, 2)):
                 stage = 3
                 continue
-        elif stage == 3 and re.fullmatch(r"Dead\s+timer\s+expires\s+in\s+\d+\s*s", line, re.I):
+        elif stage == 3 and re.fullmatch(r"Dead\s+timer\s+(?:expires\s+in\s+\d+\s*s|due\s+in\s+\d+\s+sec)", line, re.I):
             stage = 4
             continue
-        elif stage == 4 and re.fullmatch(r"Neighbor\s+has\s+been\s+up\s+for\s+\d+:\d{2}:\d{2}", line, re.I):
+        elif stage == 4 and re.fullmatch(r"Neighbor\s+(?:has\s+been|is)\s+up\s+for\s+\d+:\d{2}:\d{2}", line, re.I):
             stage = 5
             continue
+        # Ancillary fields are optional, not evidence that a partial record
+        # is complete. Recognize them only in their documented record phase.
+        optional = (
+            ("options", stage == 3, r"Options\s+is\s+0x[\da-f]+\s+\((?:[a-z]+|-)(?:\|(?:[a-z]+|-))*\)"),
+            ("authentication", stage == 5, r"Authentication\s+Sequence\s*:\s*\[\s*\d+\s*\]"),
+            ("changes", stage == 5, r"Neighbor\s+state\s+change\s+count\s*:\s*\d+"),
+            ("bfd", stage == 5, r"BFD\s+status\s*:\s*(?:Disabled|Enabled\s*\((?:Control|Echo)\s+mode\))"),
+        )
+        field = next((name for name, allowed, pattern in optional
+                      if allowed and re.fullmatch(pattern, line, re.I)), None)
+        if field is not None:
+            if field not in metadata:
+                metadata.add(field)
+                continue
+            stage = -1  # A repeated field cannot certify this record.
         complete = False
         # A conflicting/repeated field invalidates this record as evidence.
         if re.match(r"(?:State|Router\s*ID|Address|DR|BDR)\s*:", line, re.I) or stage != 5:
             stage = -1
     finish()
-    if section_rows == 0 or process_rows == 0 or not peers:
+    if section_rows == 0 or process_rows == 0 or heading_pending or not peers:
         complete = False
     return ([], False) if ambiguous else (peers, complete)
 
@@ -944,14 +1008,42 @@ def parse_ospf_snapshot(text: str) -> list[dict[str, str]] | None:
         if not complete or (total is not None and total != len(peers)):
             return None
         return peers
-    peers, area = [], ""
+    peers, area, process, ids = [], "", "", []
+    # Each announced section needs a row before another section at the same
+    # or an enclosing level starts. Otherwise a trailing/empty header could
+    # turn a partial response into a complete snapshot and false disappearances.
+    section_rows = {"process": None, "heading": None, "area": None, "table": None}
+
+    def empty_section(*levels: str) -> bool:
+        # An explicit global zero is evidence of an empty configuration even
+        # when its display includes normal headings. Real rows contradict it.
+        return total != 0 and any(section_rows[level] == 0 for level in levels)
+
     for line in lines:
+        header = re.fullmatch(r"OSPF\s+Process\s+(\d+)\s+with\s+Router\s+ID\s+(\S+)", line, re.I)
+        if header:
+            if valid_ip(header[2]) != header[2] or empty_section("process", "heading", "area", "table"):
+                return None
+            process, area = header[1], ""
+            section_rows = {"process": 0, "heading": None, "area": None, "table": None}
+            continue
+        if re.fullmatch(r"Neighbors?|Neighbor\s+Brief\s+Information", line, re.I):
+            if empty_section("heading", "area", "table"):
+                return None
+            area = ""
+            section_rows.update(heading=0, area=None, table=None)
+            continue
         header = re.fullmatch(r"Area\s*:\s*(\S+)", line, re.I)
         if header:
+            if valid_ip(header[1]) != header[1] or empty_section("area", "table"):
+                return None
             area = header.group(1)
+            section_rows.update(area=0, table=None)
             continue
-        if re.fullmatch(r"(?:OSPF\s+Process\s+\d+\s+with\s+Router\s+ID\s+[\d.]+|Neighbors?|Neighbor\s+Brief\s+Information|"
-                        r"Router\s+ID\s+Address\s+.*\b(?:State\s+Interface|Interface\s+State))", line, re.I):
+        if re.fullmatch(r"Router\s+ID\s+Address\s+.*\b(?:State\s+Interface|Interface\s+State)", line, re.I):
+            if empty_section("table"):
+                return None
+            section_rows["table"] = 0
             continue
         rows = parse_ospf(line)
         if (len(rows) != 1 or not OSPF_STATE_RE.fullmatch(rows[0]["state"]) or
@@ -966,9 +1058,13 @@ def parse_ospf_snapshot(text: str) -> list[dict[str, str]] | None:
                     not re.fullmatch(r"[A-Za-z][\w./:-]*\d[\w./:-]*", rows[0]["interface"])):
                 return None
         rows[0]["area"] = area
+        ids.append((process, area, rows[0]["router_id"], rows[0]["address"], rows[0]["interface"]))
         peers.extend(rows)
-    ids = [(p["area"], p["router_id"], p["address"], p["interface"]) for p in peers]
-    if len(ids) != len(set(ids)) or (total is not None and total != len(peers)) or (not peers and total is None):
+        for level, count in section_rows.items():
+            if count is not None:
+                section_rows[level] = count + 1
+    if (empty_section("process", "heading", "area", "table") or len(ids) != len(set(ids)) or
+            (total is not None and total != len(peers)) or (not peers and total is None)):
         return None
     return peers
 
@@ -985,6 +1081,10 @@ def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
     lines = _snapshot_lines(text, command)
     if lines is None:
         return []
+    if kind == "device":
+        lines = _device_strip_model_banner(lines)
+        if lines is None:
+            return []
     if kind == "ospf" and _ospf_is_detailed(lines):
         counted = _snapshot_count(lines, r"Total(?: number of)? (?:OSPF )?(?:neighbors?|peers?)\s*:\s*(\d+)\.?",
                                   r"No OSPF (?:neighbors?|peers?|process(?:es)?)(?: (?:are )?(?:configured|enabled|found))?\.?")
@@ -999,7 +1099,7 @@ def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
     section = ""
     device_header, power_header, power_section_kind = None, None, ""
     partial_power_sections = set()
-    device_irf = None
+    device_layout = None
     for line in lines:
         if re.match(r"No\s+", line, re.I):
             return []  # A no-configuration declaration cannot also prove a fault.
@@ -1042,17 +1142,18 @@ def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
                     return []
                 device_header = header
                 continue
-            chassis = re.match(r"(\d+)\s+\d+\b", line)
+            chassis = re.match(r"(\d+)(?:\s+|/)\d+(?=\s)", line)
             if chassis:
                 section = chassis.group(1)
-                candidate = re.match(r"\d+\s+(\d+)\b", line)
+                candidate = re.match(r"\d+(?:\s+|/)(\d+)(?=\s)", line)
             else:
                 section = ""
                 candidate = re.match(r"(?:Slot\s+)?(\d+)\b", line, re.I)
             if candidate is not None:
-                if device_irf is not None and device_irf != bool(chassis):
+                row_layout = _device_row_layout(line)
+                if device_layout is not None and device_layout != row_layout:
                     return []
-                device_irf = bool(chassis)
+                device_layout = row_layout
             parsed = _device_snapshot_row(line, device_header)
         elif kind == "lagg":
             candidate = re.match(r"((?:BAGG|RAGG|BLAGG|Bridge-Aggregation|Route-Aggregation|Blade-Aggregation)\d+)\b", line, re.I)

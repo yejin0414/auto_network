@@ -11,7 +11,7 @@ from typing import Any, Callable, Protocol
 
 from .commands import ROLE_DEVICE_TYPE, CommandSpec, check_console_command
 from .credentials import Credential
-from .parsers import clean, looks_like_error
+from .parsers import ANSI_RE, PAGER_RE, clean, looks_like_error
 
 SECRET_RE = re.compile(r"(?i)(password|passwd|secret|community)\s*[:=]?\s*\S+")
 
@@ -340,7 +340,15 @@ def run_spec(session: Session, spec: CommandSpec, ssh: dict, *, deadline: float 
                              round(time.time() - started, 2), spec.optional)
         try:
             remaining = min(timeout, deadline - time.time()) if deadline is not None else timeout
-            output = clean(session.run(cmd, max(0.001, remaining)))
+            raw = session.run(cmd, max(0.001, remaining))
+            # clean() removes pager markers, so retain incomplete responses
+            # before normalization can turn a single page into a full snapshot.
+            original = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else (raw or "")
+            if PAGER_RE.search(ANSI_RE.sub("", original)):
+                output = original
+                error = "출력에 페이지 대기 표식이 있어 전체 응답을 확인하지 못했습니다."
+                break
+            output = clean(raw)
         except Exception as exc:
             output, error = "", f"명령 실패: {type(exc).__name__} {safe_error(exc)}"
             continue

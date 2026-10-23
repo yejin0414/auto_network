@@ -1,0 +1,22 @@
+OSPF Process 1 with Router ID 203.0.113.10
+Neighbors
+Area 0.0.0.0 interface 192.0.2.10(Vlan-interface100)'s neighbors
+Router ID: 203.0.113.11 Address: 192.0.2.11 GR state: Normal
+State: Full Mode: Nbr is master Priority: 1
+DR: 192.0.2.11 BDR: 192.0.2.10 MTU: 0
+Options is 0x02 (-|-|-|-|-|-|E|-)
+Dead timer due in 33 sec
+Neighbor is up for 02:03:35
+Authentication Sequence: [ 0 ]
+Neighbor state change count: 6
+BFD status: Disabled
+
+Neighbors
+Area 0.0.0.1 interface 192.0.2.20(Vlan-interface200)'s neighbors
+Router ID: 203.0.113.12 Address: 192.0.2.12 GR state: Normal
+State: Full Mode: Nbr is slave Priority: 1
+DR: None BDR: None MTU: 1500
+Dead timer due in 38 sec
+Neighbor is up for 00:02:44
+Authentication Sequence: [ 0 ]
+Neighbor state change count: 5

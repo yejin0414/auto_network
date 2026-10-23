@@ -5,6 +5,13 @@ https://wwwsg.h3c.com/cn/d_200912/658550_30005_0.htm
 All addresses and device names below are synthetic.
 Original S7500 default detailed output is documented in section 3.1.20:
 https://www.h3c.com/en/d_200707/207783_294551_0.htm
+
+Extended detailed fields are documented for S7500E *verbose* output. Their
+synthetic response-body fixture verifies parser compatibility, not that these
+releases return detailed output for the collected default command:
+https://www.h3c.com/cn/d_200911/654940_30005_0.htm
+https://www.h3c.com/cn/d_200911/654971_30005_0.htm
+https://www.h3c.com/en/d_201601/913471_294551_0.htm
 """
 import unittest
 from pathlib import Path
@@ -16,6 +23,7 @@ from tests.test_optional_command_accuracy import evaluate
 OUTPUT = (Path(__file__).parent / "fixtures" / "comware_7506_ospf.txt").read_text(encoding="utf-8")
 BASE = {"ospf": ["203.0.113.11", "203.0.113.12"]}
 DETAIL = (Path(__file__).parent / "fixtures" / "comware_7506_ospf_detail.txt").read_text(encoding="utf-8")
+EXTENDED = (Path(__file__).parent / "fixtures" / "comware_7506_ospf_extended_detail.txt").read_text(encoding="utf-8")
 
 
 class S7506Ospf(unittest.TestCase):
@@ -90,6 +98,57 @@ class S7506Ospf(unittest.TestCase):
         self.assertIn("203.0.113.12: 인접 사라짐", check["evidence"])
         self.assertEqual(after, BASE)
 
+    def test_brief_empty_sections_cannot_seed_or_prove_disappearance(self):
+        headings = ("OSPF Process 2 with Router ID 203.0.113.20",
+                    "Neighbor Brief Information", "Neighbors", "Area: 0.0.0.2",
+                    "Router ID Address Pri Dead-Time State Interface")
+        complete = OUTPUT.split("\n", 1)[1]
+        extra_baseline = {"ospf": BASE["ospf"] + ["203.0.113.99"]}
+        for heading in headings:
+            for text in (OUTPUT + "\n" + heading, OUTPUT + "\n" + heading + "\n" + complete):
+                with self.subTest(heading=heading, text=text):
+                    self.assertIsNone(P.parse_ospf_snapshot(text))
+                    for baseline in ({}, BASE, extra_baseline):
+                        check, after = evaluate("ospf", text, base=baseline)
+                        self.assertEqual(check["level"], "unknown")
+                        self.assertEqual(after, baseline)
+                        self.assertNotIn("인접 사라짐", check["evidence"])
+
+    def test_brief_multiple_complete_sections_and_processes(self):
+        table = "Router ID Address Pri Dead-Time State Interface\n"
+        row = "203.0.113.13 192.0.2.13 1 35 Full/DR Vlan102\n"
+        section = "Area: 0.0.0.2\n" + table + row
+        for extra in (section, "Neighbor Brief Information\n" + section,
+                      "OSPF Process 2 with Router ID 203.0.113.20\nNeighbor Brief Information\n" + section):
+            with self.subTest(extra=extra):
+                rows = P.parse_ospf_snapshot(OUTPUT + extra)
+                self.assertIsNotNone(rows)
+                self.assertEqual(len(rows), 3)
+                self.assertEqual(rows[-1]["area"], "0.0.0.2")
+                check, after = evaluate("ospf", OUTPUT + extra, base={})
+                self.assertEqual(check["level"], "ok")
+                self.assertEqual(after, {"ospf": BASE["ospf"] + ["203.0.113.13"]})
+        # The same router/interface identity can belong to distinct processes.
+        second = OUTPUT.split("\n", 1)[1].replace("OSPF Process 1", "OSPF Process 2")
+        self.assertEqual(len(P.parse_ospf_snapshot(OUTPUT + second)), 4)
+
+    def test_brief_legacy_peer_rows_and_explicit_empty_contract(self):
+        legacy = "Peer 203.0.113.11 State Full\nPeer 203.0.113.12 State 2-Way"
+        self.assertEqual(len(P.parse_ospf_snapshot(legacy)), 2)
+        self.assertEqual(evaluate("ospf", legacy, base={})[1], BASE)
+        header = ("OSPF Process 1 with Router ID 203.0.113.10\nNeighbor Brief Information\n"
+                  "Area: 0.0.0.0\nRouter ID Address Pri Dead-Time State Interface\n")
+        for empty in ("No OSPF peers configured.", "Total number of OSPF peers: 0"):
+            for text in (empty, header + empty):
+                with self.subTest(text=text):
+                    self.assertEqual(P.parse_ospf_snapshot(text), [])
+                    check, after = evaluate("ospf", text, base={})
+                    self.assertEqual(check["level"], "info")
+                    self.assertEqual(after, {})
+                    check, after = evaluate("ospf", text, base=BASE)
+                    self.assertEqual(check["level"], "crit")
+                    self.assertEqual(after, BASE)
+
     def test_original_7500_default_detailed_output(self):
         rows = P.parse_ospf_snapshot(DETAIL)
         self.assertIsNotNone(rows)
@@ -156,6 +215,100 @@ class S7506Ospf(unittest.TestCase):
                 check, after = evaluate("ospf", text, base=baseline)
                 self.assertEqual(check["level"], "unknown")
                 self.assertEqual(after, baseline)
+
+    def test_extended_detailed_fields_keep_neighbor_identity(self):
+        rows = P.parse_ospf_snapshot(EXTENDED)
+        self.assertIsNotNone(rows)
+        self.assertEqual([(r["router_id"], r["area"], r["interface"], r["state"].lower()) for r in rows],
+                         [("203.0.113.11", "0.0.0.0", "Vlan-interface100", "full"),
+                          ("203.0.113.12", "0.0.0.1", "Vlan-interface200", "full")])
+        check, after = evaluate("ospf", EXTENDED, base={})
+        self.assertEqual(check["level"], "ok")
+        self.assertEqual(after, BASE)
+
+    def test_detailed_variants_are_optional_and_independent(self):
+        variants = [
+            DETAIL.replace("Address: 192.0.2.11", "Address: 192.0.2.11 GR State: Helper"),
+            DETAIL.replace("BDR: 192.0.2.10", "BDR: 192.0.2.10 MTU: 1500"),
+            DETAIL.replace("DR: 192.0.2.11 BDR: 192.0.2.10", "DR: None BDR: None"),
+            DETAIL.replace("Dead timer expires in 31s", "Options is 0x02 (-|-|-|-|-|-|E|-)\nDead timer expires in 31s"),
+            DETAIL.replace("Dead timer expires in 31s", "Dead timer due in 31 sec"),
+            DETAIL.replace("Neighbor has been up for", "Neighbor is up for"),
+            DETAIL.replace("Mode: Nbr is Master", "Mode: Null"),
+            DETAIL.replace("Mode: Nbr is Master", "Mode: Hold"),
+            DETAIL + "Authentication Sequence: [ 0 ]\n",
+            DETAIL + "Neighbor state change count: 6\n",
+            DETAIL + "BFD status: Enabled (Control mode)\n",
+            DETAIL + "BFD status: Enabled (Echo mode)\n",
+            DETAIL.replace("192.0.2.10(Vlan-interface100)", "192.0.2.10 ( Vlan-interface100 )"),
+        ]
+        for text in variants:
+            with self.subTest(text=text):
+                self.assertEqual(len(P.parse_ospf_snapshot(text)), 2)
+                check, after = evaluate("ospf", text, base={})
+                self.assertEqual(check["level"], "ok")
+                self.assertEqual(after, BASE)
+
+    def test_repeated_neighbors_heading_requires_next_complete_area(self):
+        header = "Neighbors\nArea 0.0.0.1 interface 192.0.2.20(Vlan-interface200)'s neighbor(s)\n"
+        text = DETAIL.replace("RouterID: 203.0.113.12", header + "RouterID: 203.0.113.12")
+        rows = P.parse_ospf_snapshot(text)
+        self.assertIsNotNone(rows)
+        self.assertEqual([r["area"] for r in rows], ["0.0.0.0", "0.0.0.1"])
+        for tail in ("Neighbors", header, "Neighbors\nNeighbors",
+                     "Neighbors\nOSPF Process 2 with Router ID 203.0.113.20",
+                     "Neighbors\nRouterID: 203.0.113.13 Address: 192.0.2.13"):
+            with self.subTest(tail=tail):
+                broken = text + "\n" + tail
+                self.assertIsNone(P.parse_ospf_snapshot(broken))
+                check, after = evaluate("ospf", broken, base=BASE)
+                self.assertEqual(check["level"], "unknown")
+                self.assertEqual(after, BASE)
+
+    def test_extended_metadata_cannot_complete_missing_or_invalid_core_fields(self):
+        mutations = [
+            EXTENDED.replace("State: Full Mode: Nbr is master Priority: 1\n", ""),
+            EXTENDED.replace("DR: None BDR: None MTU: 1500\n", ""),
+            EXTENDED.replace("Dead timer due in 38 sec\n", ""),
+            EXTENDED.replace("Neighbor is up for 00:02:44\n", ""),
+            EXTENDED.replace("GR state: Normal", "GR state: Unknown"),
+            EXTENDED.replace("DR: None", "DR: invalid"),
+            EXTENDED.replace("MTU: 1500", "MTU: unknown"),
+            EXTENDED.replace("Options is 0x02", "Options is unknown"),
+            EXTENDED.replace("Dead timer due in 38 sec", "Dead timer due in unknown sec"),
+            EXTENDED.replace("Neighbor is up for 00:02:44", "Neighbor is up for unknown"),
+            EXTENDED.replace("Authentication Sequence: [ 0 ]", "Authentication Sequence:"),
+            EXTENDED.replace("BFD status: Disabled", "BFD status: Unknown"),
+            EXTENDED + "Future metadata: unrecognized\n",
+        ]
+        for text in mutations:
+            with self.subTest(text=text):
+                self.assertIsNone(P.parse_ospf_snapshot(text))
+                check, after = evaluate("ospf", text, base=BASE)
+                self.assertEqual(check["level"], "unknown")
+                self.assertEqual(after, BASE)
+                self.assertEqual(evaluate("ospf", text, base={})[1], {})
+
+    def test_extended_duplicate_fields_and_history_are_not_current_neighbors(self):
+        history = ("Last Neighbor Down Event:\nRouter ID: 203.0.113.99\n"
+                   "Local Address: 192.0.2.10\nRemote Address: 192.0.2.99\n"
+                   "Time: Apr 9 03:18:19 2014\nReason: Ospf_ifachange\n")
+        for text in (EXTENDED.replace("BFD status: Disabled", "BFD status: Disabled\nBFD status: Disabled"),
+                     EXTENDED + "Neighbor state change count: 5\n", EXTENDED + history):
+            with self.subTest(text=text):
+                self.assertIsNone(P.parse_ospf_snapshot(text))
+                check, after = evaluate("ospf", text, base=BASE)
+                self.assertEqual(check["level"], "unknown")
+                self.assertEqual(after, BASE)
+                self.assertEqual(evaluate("ospf", text, base={})[1], {})
+
+    def test_extended_complete_fault_survives_partial_next_record(self):
+        text = EXTENDED.replace("State: Full Mode: Nbr is master", "State: Down Mode: None")
+        text = text.replace("Neighbor is up for 00:02:44\n", "")
+        check, after = evaluate("ospf", text, base=BASE)
+        self.assertEqual(check["level"], "crit")
+        self.assertIn("일부 해석 불가", check["summary"])
+        self.assertEqual(after, BASE)
 
 
 if __name__ == "__main__":

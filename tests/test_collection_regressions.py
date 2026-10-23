@@ -112,6 +112,64 @@ class ParserAndEvaluationRegressions(unittest.TestCase):
         self.assertEqual(evaluation["devices"]["w"]["status"], "ok")
 
 
+class PagedCollectionRegressions(unittest.TestCase):
+    RESPONSES = {
+        "device": "1 SyntheticSwitch Master\n2 SyntheticSwitch Standby",
+        "ospf": "Peer 203.0.113.1 State Full\nPeer 203.0.113.2 State Full",
+    }
+    BASELINES = {"device": {"slots": ["1", "2", "3"]},
+                 "ospf": {"ospf": ["203.0.113.1", "203.0.113.2", "203.0.113.3"]}}
+
+    def collect_and_evaluate(self, key, raw, baseline):
+        spec = next(s for s in commands_for("BB") if s.id == key)
+        session = Mock()
+        session.run.return_value = raw
+        driver = Mock()
+        driver.open.return_value = session
+        dc = collect_device(driver, {"id": "b", "name": "BB", "role": "BB", "host": "192.0.2.1"},
+                            [spec], Credential("demo", "demo-only"), {"retries": 0})
+        self.assertTrue(dc.connected)
+        self.assertEqual(session.run.call_count, 1)
+        self.assertEqual(session.run.call_args.args[0], spec.commands[0])
+        session.close.assert_called_once()
+        checks = []
+        updated = eval_backbone(dc, baseline, checks, {})
+        self.assertEqual(len(checks), 1)
+        return dc.results[key], checks[0], updated
+
+    def test_complete_outputs_still_seed_baselines_with_ansi_and_bytes(self):
+        for key, body in self.RESPONSES.items():
+            for raw in (body, body.encode(), "\x1b[32m" + body + "\x1b[0m",
+                        ("\x1b[32m" + body + "\x1b[0m").encode()):
+                with self.subTest(key=key, raw=repr(raw)):
+                    result, check, updated = self.collect_and_evaluate(key, raw, {})
+                    self.assertTrue(result.ok)
+                    self.assertEqual(result.error, "")
+                    self.assertEqual(result.output, body)
+                    self.assertEqual(check["level"], "ok")
+                    self.assertTrue(updated)
+
+    def test_paged_outputs_are_unknown_and_preserve_raw_and_baselines(self):
+        markers = ("---- More ----", "<--- More --->", "Press any key to continue",
+                   "---- \x1b[7mMore\x1b[0m ----")
+        for key, body in self.RESPONSES.items():
+            for marker in markers:
+                original = body + "\r\n" + marker
+                for raw in (original, original.encode()):
+                    for baseline in ({}, self.BASELINES[key]):
+                        with self.subTest(key=key, marker=marker, bytes=isinstance(raw, bytes),
+                                          existing=bool(baseline)):
+                            before = {name: list(values) for name, values in baseline.items()}
+                            result, check, updated = self.collect_and_evaluate(key, raw, baseline)
+                            self.assertFalse(result.ok)
+                            self.assertIn("페이지", result.error)
+                            self.assertEqual(result.output, original)
+                            self.assertEqual(check["level"], "unknown")
+                            self.assertEqual(check["summary"], result.error)
+                            self.assertEqual(updated, before)
+                            self.assertEqual(baseline, before)
+
+
 class SSHBannerRegressions(unittest.TestCase):
     @staticmethod
     def packet(payload):
