@@ -1,0 +1,15 @@
+<BB-SYNTHETIC>display ospf peer
+OSPF Process 1 with Router ID 203.0.113.10
+Neighbors
+Area 0.0.0.0 interface 192.0.2.10(Vlan-interface100)'s neighbor(s)
+RouterID: 203.0.113.11 Address: 192.0.2.11
+State: Full Mode: Nbr is Master Priority: 1
+DR: 192.0.2.11 BDR: 192.0.2.10
+Dead timer expires in 31s
+Neighbor has been up for 02:15:30
+
+RouterID: 203.0.113.12 Address: 192.0.2.12
+State: Full Mode: Nbr is Slave Priority: 1
+DR: 192.0.2.11 BDR: 192.0.2.10
+Dead timer expires in 35s
+Neighbor has been up for 01:12:45
