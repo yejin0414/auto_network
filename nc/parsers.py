@@ -998,6 +998,7 @@ def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
     rows, identities, totals = [], set(), []
     section = ""
     device_header, power_header, power_section_kind = None, None, ""
+    partial_power_sections = set()
     device_irf = None
     for line in lines:
         if re.match(r"No\s+", line, re.I):
@@ -1015,8 +1016,10 @@ def optional_partial_rows(text: str, kind: str) -> list[dict[str, Any]]:
                 return []  # Following rows cannot inherit an ambiguous member.
             if header:
                 if kind == "power":
-                    if power_section_kind and power_section_kind != header.group(1).lower():
+                    if (header.group(2) in partial_power_sections or
+                            (power_section_kind and power_section_kind != header.group(1).lower())):
                         return []
+                    partial_power_sections.add(header.group(2))
                     power_section_kind = header.group(1).lower()
                     power_header = None
                 section = header.group(2)

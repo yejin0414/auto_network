@@ -22,6 +22,17 @@ POWER = "Chassis 1:\nPower 1 State: Normal\nPower 2 State: Absent\nChassis 2:\nP
 
 
 class S7506Hardware(unittest.TestCase):
+    def test_repeated_power_section_does_not_prove_fault_with_different_ids(self):
+        before = {"power_states": {"1/1": "Normal", "1/2": "Normal"}}
+        for section in ("Chassis", "Slot"):
+            text = f"{section} 1:\nPower 1 State: Normal\n{section} 1:\nPower 2 State: Faulty"
+            with self.subTest(section=section):
+                self.assertIsNone(P.parse_power_snapshot(text))
+                self.assertEqual(P.optional_partial_rows(text, "power"), [])
+                check, after = evaluate("power", text, base=before)
+                self.assertEqual(check["level"], "unknown")
+                self.assertEqual(after, before)
+
     def test_standalone_documented_header_and_slave_role(self):
         rows = P.parse_device_slots_snapshot("<Synthetic>display device\n" + DEVICE + "\n<Synthetic>")
         self.assertEqual([(r["slot"], r["state"]) for r in rows],
