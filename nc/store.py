@@ -14,7 +14,7 @@ import time
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .report_context import capture_context, normalize_context
@@ -259,13 +259,52 @@ class Store:
         return out
 
     def get_run(self, run_id: int | None = None) -> dict | None:
-        rows = (self._q("SELECT * FROM runs WHERE id=?", (run_id,)) if run_id
-                else self._q("SELECT * FROM runs ORDER BY id DESC LIMIT 1"))
+        run, _ = self._read_run_snapshot(run_id, include_output=False)
+        return run
+
+    def get_report_snapshot(self, run_id: int | None = None) -> tuple[dict | None, Callable[[str, str], dict | None]]:
+        run, rows = self._read_run_snapshot(run_id, include_output=True)
+        raw = {(r["device_id"], r["cmd_id"]): r for r in rows}
+
+        def lookup(device_id: str, cmd_id: str) -> dict | None:
+            row = raw.get((device_id, cmd_id))
+            return self._decode_raw(row) if row is not None else None
+
+        return run, lookup
+
+    def _read_run_snapshot(self, run_id: int | None, *, include_output: bool) -> tuple[dict | None, list[sqlite3.Row]]:
+        # Capture only one run. JSON conversion, decompression and report writing
+        # happen after releasing both the SQLite snapshot and the shared lock.
+        with self._lock:
+            outer_transaction = self._db.in_transaction
+            self._db.execute("SAVEPOINT nc_run_snapshot")
+            try:
+                rows = (self._db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchall() if run_id
+                        else self._db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchall())
+                devs, raw = [], []
+                if rows:
+                    rid = rows[0]["id"]
+                    devs = self._db.execute("SELECT device_id, data FROM device_results WHERE run_id=?", (rid,)).fetchall()
+                    columns = "device_id, cmd_id, label, command, ok, error, duration"
+                    if include_output:
+                        columns += ", output"
+                    raw = self._db.execute(f"SELECT {columns} FROM raw_outputs WHERE run_id=? ORDER BY rowid", (rid,)).fetchall()
+                self._db.execute("RELEASE nc_run_snapshot")
+            except BaseException:
+                # SQLite may already have rolled back on an I/O/interrupt error.
+                # Preserve that error and never roll back a caller's transaction.
+                try:
+                    self._db.execute("RELEASE nc_run_snapshot")
+                except sqlite3.Error:
+                    if not outer_transaction:
+                        try:
+                            self._db.rollback()
+                        except sqlite3.Error:
+                            pass
+                raise
         if not rows:
-            return None
+            return None, []
         r = rows[0]
-        devs = self._q("SELECT device_id, data FROM device_results WHERE run_id=?", (r["id"],))
-        raw = self._q("SELECT device_id, cmd_id, label, command, ok, error, duration FROM raw_outputs WHERE run_id=? ORDER BY rowid", (r["id"],))
         cmds: dict[str, list] = {}
         for x in raw:
             cmds.setdefault(x["device_id"], []).append({
@@ -283,13 +322,16 @@ class Store:
             context = None
         return {"id": r["id"], "started": r["started"], "finished": r["finished"], "trigger": r["trigger"],
                 "overall": r["overall"], "summary": json.loads(r["summary"] or "{}"), "devices": devices,
-                "report_context": context}
+                "report_context": context}, raw
 
     def get_raw(self, run_id: int, device_id: str, cmd_id: str) -> dict | None:
         rows = self._q("SELECT * FROM raw_outputs WHERE run_id=? AND device_id=? AND cmd_id=?", (run_id, device_id, cmd_id))
         if not rows:
             return None
-        r = rows[0]
+        return self._decode_raw(rows[0])
+
+    @staticmethod
+    def _decode_raw(r: sqlite3.Row) -> dict:
         return {"command": r["command"], "label": r["label"], "ok": bool(r["ok"]), "error": r["error"],
                 "duration": r["duration"], "output": zlib.decompress(r["output"]).decode("utf-8", "replace")}
 

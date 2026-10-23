@@ -105,6 +105,8 @@ class App:
             return 200, self.state()
         if path == "/api/run":
             rid = int(q["id"]) if q.get("id") else None
+            if rid is not None and not -(2 ** 63) <= rid < 2 ** 63:
+                raise ValueError("Python int too large to convert to SQLite INTEGER")
             run = st.get_run(rid)
             return (200, run) if run else (404, {"error": "점검 기록이 없습니다."})
         if path == "/api/runs":
@@ -147,12 +149,12 @@ class App:
         if path in ("/api/excel_open", "/api/excel_save"):
             from .excel import save_report
             cfg = eng.cfg.get()
-            run = eng.store.get_run(int(body["id"]) if body.get("id") else None)
+            run, raw = eng.store.get_report_snapshot(int(body["id"]) if body.get("id") else None)
             if not run:
                 return 404, {"error": "점검 기록이 없습니다."}
             try:
                 p = save_report(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                lambda dev, cmd, rid=run["id"]: eng.store.get_raw(rid, dev, cmd),
+                                raw,
                                 eng.report_folder(cfg), cfg["retention_days"])
             except PermissionError:
                 return 409, {"error": "같은 이름의 엑셀 파일이 열려 있어 저장하지 못했습니다. 엑셀에서 닫고 다시 누르세요."}
@@ -285,6 +287,12 @@ def _open_path(p) -> None:
 def make_handler(app: App):
     allowed_hosts = None
 
+    def _token_matches(value: str) -> bool:
+        try:
+            return secrets.compare_digest(value, app.token)
+        except TypeError:
+            return False
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "AutoNetwork.NetcheckCenter"
 
@@ -314,7 +322,7 @@ def make_handler(app: App):
             self.wfile.write(data)
 
         def _token_ok(self) -> bool:
-            return secrets.compare_digest(self.headers.get("X-NC-Token", ""), app.token)
+            return _token_matches(self.headers.get("X-NC-Token", ""))
 
         def do_GET(self) -> None:
             if not self._host_ok():
@@ -337,18 +345,27 @@ def make_handler(app: App):
                     ctype += "; charset=utf-8"
                 return self._send(200, target.read_bytes(), ctype)
             if url.path in ("/report.xlsx", "/report"):
-                if not secrets.compare_digest(q.get("t", ""), app.token):
+                if not _token_matches(q.get("t", "")):
                     return self._send(403, {"error": "권한 없음"})
                 try:
-                    run = app.engine.store.get_run(int(q["id"]) if q.get("id") else None)
+                    rid = int(q["id"]) if q.get("id") else None
+                except (KeyError, ValueError) as exc:
+                    return self._send(400, {"error": f"요청 값 오류: {exc}"})
+                try:
+                    try:
+                        if url.path == "/report.xlsx":
+                            run, raw = app.engine.store.get_report_snapshot(rid)
+                        else:
+                            run = app.engine.store.get_run(rid)
+                    except OverflowError as exc:
+                        return self._send(400, {"error": f"요청 값 오류: {exc}"})
                     if not run:
                         return self._send(404, {"error": "점검 기록이 없습니다."})
                     cfg = app.engine.cfg.get()
                     if url.path == "/report.xlsx":
                         from urllib.parse import quote
                         from .excel import build_workbook, report_filename
-                        data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                              lambda dev, cmd: app.engine.store.get_raw(run["id"], dev, cmd))
+                        data = build_workbook(run, cfg.get("site_name", ""), cfg["thresholds"], raw)
                         name = report_filename(run)
                         return self._send(200, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                           {"Content-Disposition": f"attachment; filename=\"netcheck.xlsx\"; filename*=UTF-8''{quote(name)}"})
@@ -371,7 +388,7 @@ def make_handler(app: App):
             url0 = urlparse(self.path)
             if url0.path == "/api/bye":  # 창을 닫을 때 화면이 보내는 신호(sendBeacon은 헤더를 못 붙여 주소에 토큰)
                 q0 = {k: v[0] for k, v in parse_qs(url0.query).items()}
-                if self._host_ok() and secrets.compare_digest(q0.get("t", ""), app.token) and app.watch:
+                if self._host_ok() and _token_matches(q0.get("t", "")) and app.watch:
                     app.watch.bye()
                 return self._send(204, b"", "text/plain")
             if not self._host_ok() or not self._token_ok():

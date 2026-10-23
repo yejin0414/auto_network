@@ -7,7 +7,8 @@ import copy
 import sqlite3
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,13 @@ from typing import Any
 from . import parsers as P
 from .collector import CmdResult, DeviceCollection, collect_device, run_spec, safe_error
 from .commands import CLUSTER_COMMANDS, check_console_command, commands_for
-from .config import ConfigStore, ssh_for
+from .config import ConfigStore, device_identities, ssh_for
 from .credentials import CredentialStore
 from .evaluate import evaluate_run
 from .store import Store
 
 log = logging.getLogger("netcheck")
+_DEVICE_POLL_SECONDS = 1.0
 
 
 def next_slot(now: float, interval_min: int, align: bool, last_start: float | None) -> float:
@@ -46,17 +48,37 @@ def device_time_limit(device: dict, ssh: dict) -> float:
     return max(300.0, s["connect_timeout"] * (int(s.get("retries", 1)) + 1) + s["command_timeout"] * 3)
 
 
-def _abort_session(holder: dict) -> None:
+def _abort_session(holder: dict) -> threading.Thread | None:
     sess = holder.get("session")
     if sess is None:
         return
     fn = getattr(sess, "abort", None) or getattr(sess, "close", None)
     if fn:
-        threading.Thread(target=fn, name="netcheck-abort", daemon=True).start()
+        worker = threading.Thread(target=fn, name="netcheck-abort", daemon=True)
+        worker.start()
+        return worker
 
 
 class _Abandoned(Exception):
     """중단 처리된(너무 오래 걸린) 점검이 뒤늦게 끝남"""
+
+
+@dataclass
+class _DeviceWork:
+    identity: tuple
+    gen: int
+    future: Future = field(default_factory=Future)
+    cancel: threading.Event = field(default_factory=threading.Event)
+    holder: dict = field(default_factory=dict)
+    started: float | None = None
+    started_clock: float | None = None
+    cleanup_until: float = 0.0
+    thread: threading.Thread | None = None
+    abort_thread: threading.Thread | None = None
+
+    def alive(self) -> bool:
+        return bool((self.thread and self.thread.is_alive())
+                    or (self.abort_thread and self.abort_thread.is_alive()))
 
 
 class Engine:
@@ -82,6 +104,9 @@ class Engine:
         self.max_run_seconds = 40 * 60  # 이보다 오래 걸리는 점검은 멈춘 것으로 보고 다음 점검을 막지 않음
         self.device_grace = 45.0        # 장비 제한 시간 뒤 이만큼 더 기다렸다가 강제 중단
         self.cluster_fallback_seconds = 300.0  # 모든 클러스터 대체 수집을 합친 시간 예산
+        # Keep unfinished attempts across runs; a timeout cannot free a live
+        # thread's slot. Both collection and its single abort helper must exit.
+        self._device_workers: list[_DeviceWork] = []
 
     # ------------------------------------------------------------- 상태
     def status(self) -> dict[str, Any]:
@@ -170,10 +195,24 @@ class Engine:
     def _run_cancelled(self, gen: int) -> bool:
         return self._stop.is_set() or bool(gen and gen != self._gen)
 
-    def _set_progress(self, gen: int, device_id: str, message: str) -> None:
+    def _set_progress(self, gen: int, device_id: str, message: str,
+                      cancel: threading.Event | None = None) -> None:
         with self._lock:
-            if not self._run_cancelled(gen):
+            if not self._run_cancelled(gen) and not (cancel and cancel.is_set()):
                 self.progress[device_id] = message
+
+    def _cancel_device_worker(self, worker: _DeviceWork) -> None:
+        """Caller holds _lock, also used by progress publication."""
+        if not worker.cancel.is_set():
+            worker.cancel.set()
+            # Fixed once per attempt, including when another run takes over.
+            worker.cleanup_until = time.monotonic() + max(self.device_grace, _DEVICE_POLL_SECONDS)
+            try:
+                worker.abort_thread = _abort_session(worker.holder)
+            except RuntimeError as exc:
+                # A failed helper start must not release the live worker's slot
+                # or prevent other attempts from being cancelled and recorded.
+                log.warning("연결 종료 작업을 시작하지 못했습니다: %s", type(exc).__name__)
 
     @staticmethod
     def _cluster_result_usable(key: str, result: CmdResult | None) -> bool:
@@ -336,42 +375,81 @@ class Engine:
                 raise _Abandoned()
             self.progress = {d["id"]: "대기" for d in devices}
         limits = {d["id"]: device_time_limit(d, ssh) for d in devices}
-        started_at: dict[str, float] = {}
-        holders: dict[str, dict] = {d["id"]: {} for d in devices}
+        identities = {key: (key, *identity) for key, identity in device_identities(cfg).items()}
 
-        def job(d: dict) -> DeviceCollection:
-            if self._run_cancelled(gen):
-                raise _Abandoned()
-            started_at[d["id"]] = time.time()
+        def job(d: dict, worker: _DeviceWork) -> DeviceCollection:
+            with self._lock:
+                if worker.cancel.is_set() or self._run_cancelled(gen):
+                    raise _Abandoned()
+                worker.started = time.time()
+                worker.started_clock = time.monotonic()
             specs = commands_for(d["role"], cfg["extra_commands"].get(d["role"]))
             if d["id"] in primary_ids:
                 specs += list(CLUSTER_COMMANDS)
-            self._set_progress(gen, d["id"], "접속 중")
+            self._set_progress(gen, d["id"], "접속 중", worker.cancel)
 
             def prog(msg: str, did=d["id"], name=d["name"]) -> None:
-                self._set_progress(gen, did, msg[len(name):].strip() if msg.startswith(name) else msg)
+                self._set_progress(gen, did, msg[len(name):].strip() if msg.startswith(name) else msg, worker.cancel)
 
             dc = collect_device(self.driver, d, specs, self.creds.get(d["credential"]), ssh, prog,
-                                deadline=started_at[d["id"]] + limits[d["id"]], holder=holders[d["id"]],
-                                cancelled=lambda: self._run_cancelled(gen))
-            self._set_progress(gen, d["id"], "완료" if dc.connected else "실패")
+                                deadline=worker.started + limits[d["id"]], holder=worker.holder,
+                                cancelled=lambda: worker.cancel.is_set() or self._run_cancelled(gen))
+            self._set_progress(gen, d["id"], "완료" if dc.connected else "실패", worker.cancel)
             return dc
+
+        def execute(d: dict, worker: _DeviceWork) -> None:
+            if worker.future.set_running_or_notify_cancel():
+                try:
+                    result = job(d, worker)
+                except BaseException as exc:
+                    worker.future.set_exception(exc)
+                else:
+                    worker.future.set_result(result)
 
         got: dict[str, DeviceCollection] = {}
         if devices:
-            # 장비마다 제한 시간을 두고, 넘기면 세션을 끊고 '응답 없음'으로 처리해 점검이 반드시 끝나게 함
-            pool = ThreadPoolExecutor(max_workers=max(1, int(ssh.get("parallel", 6))), thread_name_prefix="netcheck-dev")
-            futs = {pool.submit(job, d): d for d in devices}
-            pending = set(futs)
+            parallel = max(1, int(ssh.get("parallel", 6)))
+            queued = list(devices)
+            futs: dict[Future, tuple[dict, _DeviceWork]] = {}
+            pending: set[Future] = set()
             try:
-                while pending:
-                    if self._run_cancelled(gen):
-                        raise _Abandoned()
-                    done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                while queued or pending:
+                    with self._lock:
+                        if self._run_cancelled(gen):
+                            raise _Abandoned()
+                        self._device_workers[:] = [w for w in self._device_workers if w.alive()]
+                        for worker in self._device_workers:
+                            if self._run_cancelled(worker.gen):
+                                self._cancel_device_worker(worker)
+                        busy = {w.identity for w in self._device_workers}
+                        for d in list(queued):
+                            if len(self._device_workers) >= parallel:
+                                break
+                            identity = identities[d["id"]]
+                            if identity in busy:
+                                continue
+                            worker = _DeviceWork(identity, gen)
+                            worker.thread = threading.Thread(target=execute, args=(d, worker),
+                                                             name="netcheck-dev", daemon=True)
+                            self._device_workers.append(worker)
+                            try:
+                                worker.thread.start()
+                            except BaseException:
+                                self._device_workers.remove(worker)
+                                raise
+                            futs[worker.future] = (d, worker)
+                            pending.add(worker.future)
+                            busy.add(identity)
+                            queued.remove(d)
+                    if pending:
+                        done, pending = wait(pending, timeout=_DEVICE_POLL_SECONDS, return_when=FIRST_COMPLETED)
+                    else:
+                        done = set()
+                        self._stop.wait(min(0.05, _DEVICE_POLL_SECONDS))
                     if self._run_cancelled(gen):
                         raise _Abandoned()
                     for f in done:
-                        d = futs[f]
+                        d, _worker = futs[f]
                         try:
                             got[d["id"]] = f.result()
                         except Exception as exc:  # pragma: no cover - 방어
@@ -379,27 +457,46 @@ class Engine:
                             got[d["id"]] = DeviceCollection(device_id=d["id"], connected=False, started=time.time(),
                                                             error=f"점검 중 오류: {type(exc).__name__} {exc}",
                                                             error_kind="error", finished=time.time())
-                    now_t = time.time()
+                    now_t, clock = time.time(), time.monotonic()
                     for f in list(pending):
-                        d = futs[f]
-                        st = started_at.get(d["id"])
-                        if st and now_t - st > limits[d["id"]] + self.device_grace:
+                        d, worker = futs[f]
+                        st = worker.started
+                        if worker.started_clock is not None and clock - worker.started_clock > limits[d["id"]] + self.device_grace:
                             pending.discard(f)
-                            _abort_session(holders[d["id"]])
-                            mins = max(1, round((now_t - st) / 60))
+                            with self._lock:
+                                self._cancel_device_worker(worker)
+                                if not self._run_cancelled(gen):
+                                    self.progress[d["id"]] = "응답 없음"
+                            mins = max(1, round((clock - worker.started_clock) / 60))
                             log.warning("%s: %d분 넘게 응답이 없어 이 장비 점검을 중단합니다", d["name"], mins)
-                            self._set_progress(gen, d["id"], "응답 없음")
                             got[d["id"]] = DeviceCollection(
                                 device_id=d["id"], connected=False, started=st, finished=now_t, error_kind="timeout",
                                 error=(f"응답 없음: {mins}분 넘게 점검이 끝나지 않아 이 장비는 중단했습니다. "
                                        "장비 부하·회선 상태를 확인하거나 설정 → 접속 대기 시간을 조정하세요."))
                     if self._run_cancelled(gen):
                         raise _Abandoned()
+                    if queued and not pending:
+                        with self._lock:
+                            self._device_workers[:] = [w for w in self._device_workers if w.alive()]
+                            busy = {w.identity for w in self._device_workers}
+                            if len(self._device_workers) < parallel and any(identities[d["id"]] not in busy for d in queued):
+                                continue
+                            if all(w.cancel.is_set() and time.monotonic() >= w.cleanup_until for w in self._device_workers):
+                                for d in queued:
+                                    got[d["id"]] = DeviceCollection(
+                                        device_id=d["id"], connected=False, started=now_t, finished=now_t,
+                                        error_kind="timeout",
+                                        error="이전 수집 작업의 연결 종료를 확인하지 못해 접속을 시도하지 않았습니다. "
+                                              "이전 연결이 종료된 뒤 다시 점검하세요.")
+                                    if not self._run_cancelled(gen):
+                                        self.progress[d["id"]] = "실패"
+                                queued.clear()
             finally:
-                if self._run_cancelled(gen):
-                    for holder in holders.values():
-                        _abort_session(holder)
-                pool.shutdown(wait=False, cancel_futures=True)
+                with self._lock:
+                    for _d, worker in futs.values():
+                        if not worker.future.done():
+                            self._cancel_device_worker(worker)
+                    self._device_workers[:] = [w for w in self._device_workers if w.alive()]
         collections: dict[str, DeviceCollection] = {d["id"]: got[d["id"]] for d in devices if d["id"] in got}
 
         clusters = self._collect_clusters(groups, primaries, collections, ssh, gen)
@@ -457,11 +554,12 @@ class Engine:
             try:
                 from .excel import save_report
 
-                path = save_report(run, cfg.get("site_name", ""), cfg["thresholds"],
-                                   lambda dev, cmd: self.store.get_raw(run_id, dev, cmd),
-                                   self.report_folder(cfg), cfg["retention_days"])
-                saved = str(path)
-                self.last_report = saved
+                report_run, raw = self.store.get_report_snapshot(run_id)
+                if report_run is not None:
+                    path = save_report(report_run, cfg.get("site_name", ""), cfg["thresholds"], raw,
+                                       self.report_folder(cfg), cfg["retention_days"])
+                    saved = str(path)
+                    self.last_report = saved
             except Exception as exc:
                 log.warning("엑셀 보고서 저장 실패: %s", exc)
                 self.last_error = (self.last_error + " " if self.last_error else "") + f"엑셀 보고서를 저장하지 못했습니다: {type(exc).__name__} {exc}"

@@ -65,7 +65,7 @@ def valid_ip(value: str) -> str | None:
 
 def to_int(value: str) -> int | None:
     v = (value or "").strip().replace(",", "")
-    return int(v) if v.isdigit() and len(v) < 19 else None
+    return int(v) if v.isdecimal() and len(v) < 19 else None
 
 
 def _norm(label: str) -> str:
@@ -163,9 +163,13 @@ def parse_uptime(text: str) -> int | None:
         return None
     total = 0
     found = False
-    for num, unit in re.findall(r"(\d+)\s*(years?|weeks?|days?|hours?|minutes?|mins?|seconds?|secs?)", m.group(1), re.I):
+    for num, unit in re.findall(r"(?:^|[,\s])(\S+?)\s*(years?|weeks?|days?|hours?|minutes?|mins?|seconds?|secs?)\b", m.group(1), re.I):
+        num = num.removeprefix("+")
+        value = to_int(num) if num.isdecimal() else None
+        if value is None:
+            return None
         key = unit.lower().rstrip("s")
-        total += int(num) * UNIT_SECONDS.get(key, 0)
+        total += value * UNIT_SECONDS.get(key, 0)
         found = True
     return total if found else None
 
@@ -193,6 +197,14 @@ def parse_version(text: str) -> dict[str, str]:
 # --------------------------------------------------------------------------- CPU / 메모리
 
 PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+PCT_TOKEN_RE = re.compile(r"((?:[+-]?\d+,)*[^\s%,:=()]+)\s*%")
+
+
+def _percent(value: str) -> float | None:
+    if not re.fullmatch(r"\d+(?:\.\d+)?", value):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and 0 <= number <= 100 else None
 
 
 def parse_cpu_comware(text: str) -> dict[str, Any] | None:
@@ -207,13 +219,16 @@ def parse_cpu_comware(text: str) -> dict[str, Any] | None:
             in_table = True  # 요약표 머리글: Slot CPU Last 5 sec Last 1 min Last 5 min
             continue
         if in_table:
-            pcts = PCT_RE.findall(line)
+            pcts = PCT_TOKEN_RE.findall(line)
             if len(pcts) >= 3:
+                values = [_percent(value.removeprefix("+")) for value in pcts[-3:]]
+                if any(value is None for value in values):
+                    return None
                 label = PCT_RE.sub("", line).split()
                 slots.append({"slot": "/".join(t for t in label if t not in ("-",)) or str(len(slots) + 1),
-                              "5s": float(pcts[-3]), "1m": float(pcts[-2]), "5m": float(pcts[-1])})
+                              "5s": values[0], "1m": values[1], "5m": values[2]})
             elif line.strip() and not SEPARATOR_RE.match(line):
-                in_table = bool(PCT_RE.search(line))
+                in_table = bool(PCT_TOKEN_RE.search(line))
     if not slots:
         # 상세 형식: "Slot 1 CPU 0 CPU usage:" 아래 "6% in last 5 seconds"
         cur: dict[str, Any] | None = None
@@ -225,13 +240,19 @@ def parse_cpu_comware(text: str) -> dict[str, Any] | None:
                 slots.append(cur)
                 continue
             for key, lab in labels.items():
-                v = re.search(rf"(\d+(?:\.\d+)?)\s*%\s*in\s+last\s+{lab}\b", line, re.I) or \
-                    re.search(rf"\b{lab}\s*[:=]\s*(\d+(?:\.\d+)?)\s*%", line, re.I)
+                v = re.search(rf"((?:[+-]?\d+,)*[^\s%,:=()]+)\s*%\s*in\s+last\s+{lab}\b", line, re.I)
+                if not v:
+                    v = re.search(rf"\b{lab}\s*[:=]\s*((?:[+-]?\d+,)*[^\s%,:=()]+)\s*%", line, re.I)
+                    if v and v.group(1).startswith("+"):
+                        continue
                 if v:
+                    value = _percent(v.group(1).removeprefix("+"))
+                    if value is None:
+                        return None
                     if cur is None:
                         cur = {"slot": "1"}
                         slots.append(cur)
-                    cur.setdefault(key, float(v.group(1)))
+                    cur.setdefault(key, value)
         slots = [x for x in slots if any(k in x for k in ("5s", "1m", "5m"))]
     if not slots:
         return None
@@ -279,6 +300,8 @@ def parse_mem_comware(text: str) -> dict[str, Any] | None:
         row = {c: _num(v) for c, v in zip(cols, values)}
         if row.get("total") is None or row.get("free") is None:
             continue
+        if any(key in row and row[key] is None for key in ("used", "freeratio")):
+            continue
         total, free = row["total"], row["free"]
         used = row.get("used") if row.get("used") is not None else total - free
         if total <= 0 or not 0 <= free <= total or not 0 <= used <= total:
@@ -295,10 +318,10 @@ def parse_mem_comware(text: str) -> dict[str, Any] | None:
         if ratios:
             free = min(ratios)
             return {"free_ratio": free, "used_pct": round(100 - free, 1), "slots": []}
-        m = re.search(r"Total\s+(\d+)\s+Used\s+(\d+)", body, re.I)
-        if m and int(m.group(1)) > 0:
-            t, u = int(m.group(1)), int(m.group(2))
-            if u > t:
+        m = re.search(r"Total\s+(\d+)\s+Used\s+(\d+)(?![\w.+-]|,\d)", body, re.I)
+        if m:
+            t, u = to_int(m.group(1)), to_int(m.group(2))
+            if t is None or u is None or t <= 0 or u > t:
                 return None
             r = round((t - u) / t * 100, 1)
             return {"free_ratio": r, "used_pct": round(100 - r, 1), "total_kb": t, "used_kb": u, "free_kb": t - u,
@@ -313,12 +336,14 @@ def parse_cpu_aruba(text: str) -> dict[str, float] | None:
     """show cpu / show cpuload → user, system, idle (%)."""
     body = clean(text)
     def grab(name: str) -> float | None:
-        m = re.search(rf"\b{name}\s*[:=]?\s*(\d+(?:\.\d+)?)\s*%", body, re.I)
-        return float(m.group(1)) if m else None
+        m = re.search(rf"\b{name}\s*[:=]?\s*([^\s%]+)\s*%", body, re.I)
+        return _percent(m.group(1)) if m else None
     user, system, idle = grab("user"), grab("system"), grab("idle")
     if user is None or system is None:
         return None
     if idle is None:
+        if re.search(r"\bidle\b", body, re.I):
+            return None
         idle = round(max(0.0, 100 - user - system), 1)
     return {"user": user, "system": system, "idle": idle, "1m": round(100 - idle, 1)}
 
@@ -326,11 +351,11 @@ def parse_cpu_aruba(text: str) -> dict[str, float] | None:
 def parse_mem_aruba(text: str) -> dict[str, float] | None:
     """show memory → Memory (Kb): total: X, used: Y, free: Z."""
     body = clean(text)
-    m = re.search(r"total\s*:?\s*(\d+)\s*,?\s*used\s*:?\s*(\d+)\s*,?\s*free\s*:?\s*(\d+)", body, re.I)
+    m = re.search(r"total\s*:?\s*(\d+)\s*,?\s*used\s*:?\s*(\d+)\s*,?\s*free\s*:?\s*(\d+)(?![\w.+-]|,\d)", body, re.I)
     if not m:
         return None
-    total, used, free = (int(x) for x in m.groups())
-    if total <= 0:
+    total, used, free = (to_int(x) for x in m.groups())
+    if total is None or used is None or free is None or total <= 0 or not 0 <= used <= total or not 0 <= free <= total:
         return None
     pct = round(used / total * 100, 1)
     return {"total_kb": total, "used_kb": used, "free_kb": free, "used_pct": pct, "free_ratio": round(100 - pct, 1)}
@@ -466,14 +491,18 @@ def parse_vrrp_snapshot(text: str) -> list[dict[str, str]] | None:
         if (table_row or verbose_header) and not parse_vrrp(line):
             return None
     totals = re.findall(r"^\s*Total\s+number\s+of\s+virtual\s+routers\s*:\s*(\d+)\s*$", body, re.I | re.M)
-    if totals and (len(set(totals)) != 1 or int(totals[0]) != len(groups)):
+    total = to_int(totals[0]) if totals else None
+    if totals and (len(set(totals)) != 1 or total is None or total != len(groups)):
         return None
     if groups:
+        if any(not _vrrp_numbers_valid(g["interface"], g["vrid"]) or
+               (g["priority"] and to_int(g["priority"]) is None) for g in groups):
+            return None
         keys = [vrrp_group_key(g["interface"], g["vrid"]) for g in groups]
         if len(keys) != len(set(keys)) or any(g["state"] not in ("Master", "Backup", "Initialize", "Inactive") for g in groups):
             return None
         return groups
-    if totals and int(totals[0]) == 0:
+    if totals and total == 0:
         return []
     # Only an explicit no-configuration message counts as a verified empty set.
     if re.fullmatch(r"\s*No\s+VRRP\s+(?:groups?\s+)?configured\.?\s*", body, re.I):
@@ -508,13 +537,24 @@ def log_time_ts(text: str, now: float | None = None) -> float | None:
     return dt.timestamp()
 
 
+def _vrrp_numbers_valid(intf: str, vrid: str) -> bool:
+    vlan = re.fullmatch(r"vlan(?:-interface|if)?(\d+)", re.sub(r"\s+", "", intf or ""), re.I)
+    return (not vrid or to_int(vrid) is not None) and (vlan is None or to_int(vlan.group(1)) is not None)
+
+
+def _decimal_key(value: str) -> str:
+    # Preserve Unicode decimal digits and leading-zero normalization without
+    # converting an unbounded stored identity to one large Python integer.
+    return ("".join(str(int(ch)) for ch in value).lstrip("0") or "0") if value.isdecimal() else value
+
+
 def vrrp_group_key(intf: str, vrid: str) -> str:
     """show vrrp의 'Vlan20' 와 로그의 'Vlan-interface20' 를 같은 그룹으로 맞춤."""
     i = re.sub(r"\s+", "", intf or "")
     vlan = re.fullmatch(r"vlan(?:-interface|if)?(\d+)", i, re.I)
-    i = f"Vlan{int(vlan.group(1))}" if vlan else i.casefold()
+    i = f"Vlan{_decimal_key(vlan.group(1))}" if vlan else i.casefold()
     v = str(vrid).strip()
-    v = str(int(v)) if v.isdigit() else v
+    v = _decimal_key(v)
     return f"{i}/{v}"
 
 
@@ -531,6 +571,8 @@ def parse_vrrp_logs(text: str, now: float | None = None) -> list[dict[str, Any]]
         vid = _VRRP_ID.search(x["message"])
         intf = _VRRP_INTF.search(x["message"])
         vrid = vid.group(1) if vid else ""
+        if not _vrrp_numbers_valid(intf.group(1) if intf else "", vrid):
+            continue
         out.append({
             "time": x["time"], "ts": log_time_ts(x["time"], now=now), "vrid": vrid,
             "interface": (intf.group(1) if intf else ""),

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -64,8 +65,10 @@ class ExcelReport(unittest.TestCase):
         cls.engine = Engine(ConfigStore(d / "c.json"), Store(d / "db"), cr, DemoWorld(speed=0), demo=True)
         cls.addClassCleanup(cls.engine.store._db.close)
         cls.engine.reports_dir = d / "보고서"
-        for _ in range(27):  # 27번째 회차: 백본 3호기 장애 시나리오
-            cls.engine.run_blocking("auto")
+        # 낮의 균형 분배를 검증하며, 실행 당일을 사용해 이력 보관 기간도 유지한다.
+        first_run = datetime.now().replace(hour=13, minute=0, second=0, microsecond=0).timestamp()
+        for i in range(27):  # 27번째 회차: 백본 3호기 장애 시나리오
+            cls.engine.run_blocking("auto", now=first_run + i * 60)
         cls.run_ = cls.engine.store.get_run()
         cls.dir = d
 
@@ -111,6 +114,8 @@ class ExcelReport(unittest.TestCase):
         # OUT은 OUT끼리만 비교: 수용량이 작아도 'Client 낮음' 주의가 나오지 않음
         self.assertFalse(any(c["key"] == "clients" and c["level"] == "warn" for d in out for c in d["checks"]))
         self.assertTrue(all(any(c["key"] == "cluster" and c["level"] == "ok" for c in d["checks"]) for d in out))
+        self.assertTrue(any(c["key"] == "clients" and c["level"] == "warn"
+                            for c in self.run_["devices"]["wlc3"]["checks"]))
 
     def test_auto_saved_after_each_check(self):
         files = list((self.dir / "보고서").glob("무선망점검_*.xlsx"))
